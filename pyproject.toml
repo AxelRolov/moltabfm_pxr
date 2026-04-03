@@ -24,6 +24,9 @@ dependencies = [
     "gradio-client",
     "tabicl",
     "mordredcommunity",
+    "torch",
+    "transformers==4.57.3",
+    "sentencepiece",
 ]
 
 [dependency-groups]
