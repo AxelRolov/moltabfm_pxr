@@ -13,6 +13,8 @@ This repository is not meant to be a general overview of the OpenADMET PXR chall
 
 **How far can tabular foundation models go on the PXR activity task, and what descriptor/ensemble setup works best?**
 
+It is based on the OpenADMET tutorial repository: [`OpenADMET/PXR-Challenge-Tutorial`](https://github.com/OpenADMET/PXR-Challenge-Tutorial).
+
 The current emphasis is on fast, reproducible experiments around:
 
 - `TabICL` as the main tabular foundation model
