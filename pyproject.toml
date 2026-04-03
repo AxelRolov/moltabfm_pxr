@@ -1,7 +1,7 @@
 [project]
-name = "pxr-challenge-tutorial"
+name = "moltabfm-pxr"
 version = "0.1.0"
-description = "Tutorial and evaluation toolkit for the OpenADMET PXR Blind Challenge"
+description = "Tabular foundation model experiments for PXR pEC50 prediction"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
