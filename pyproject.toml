@@ -1,0 +1,33 @@
+[project]
+name = "pxr-challenge-tutorial"
+version = "0.1.0"
+description = "Tutorial and evaluation toolkit for the OpenADMET PXR Blind Challenge"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "rdkit",
+    "pandas",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    "jupyterlab",
+    "numpy",
+    "lightgbm",
+    "tqdm",
+    "fsspec",
+    "datasets",
+    "scipy",
+    "biotite",
+    "nglview",
+    "mdanalysis",
+    "useful-rdkit-utils @ git+https://github.com/PatWalters/useful_rdkit_utils.git@master",
+    "gradio-client",
+    "tabicl",
+    "mordredcommunity",
+]
+
+[dependency-groups]
+test = [
+    "nbmake",
+    "pytest-xdist",
+]
