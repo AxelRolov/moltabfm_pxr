@@ -1,72 +1,124 @@
 # PXR Challenge Model Lab
 
-> A compact experiment repo for testing **tabular foundation models** on **PXR pEC50 prediction**.
+Focused workspace for OpenADMET PXR challenge experiments, with the current emphasis on the **activity track**, `uv`-managed environments, and notebook-first iteration.
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-0b3d91)](./pyproject.toml)
 [![uv](https://img.shields.io/badge/env-uv-5c7cfa)](https://github.com/astral-sh/uv)
-[![Task](https://img.shields.io/badge/task-tabular%20bioactivity-0f766e)](./notebooks/tabfm_activity_prediction.ipynb)
+[![Activity](https://img.shields.io/badge/activity-TabICL%20%2B%20foundation%20embeddings-0f766e)](./notebooks/fm_activity_prediction.ipynb)
 [![Baseline](https://img.shields.io/badge/baseline-LightGBM-365314)](./notebooks/activity_prediction.ipynb)
 
 ## What This Repo Is
 
-This repository is not meant to be a general overview of the OpenADMET PXR challenge. It is a focused workspace for answering one practical question:
+This repository started from the OpenADMET PXR tutorial setup and has been reshaped into a compact experiment lab for:
 
-**How far can tabular foundation models go on the PXR activity task, and what descriptor/ensemble setup works best?**
+- activity prediction notebooks and submission generation
+- structure-track example workflows
+- local validation and evaluation utilities
+- foundation-model feature experiments for small-molecule activity prediction
 
-It is based on the OpenADMET tutorial repository: [`OpenADMET/PXR-Challenge-Tutorial`](https://github.com/OpenADMET/PXR-Challenge-Tutorial).
+The center of gravity is now [`notebooks/fm_activity_prediction.ipynb`](./notebooks/fm_activity_prediction.ipynb), which extends the original TabICL workflow with modern molecular embeddings.
 
-The current emphasis is on fast, reproducible experiments around:
+## Current Notebook Set
 
-- `TabICL` as the main tabular foundation model
-- classical descriptor baselines such as `LightGBM`
-- multi-descriptor training across RDKit, Morgan, and Mordred feature spaces
-- PCA vs raw feature views
-- simple, robust ensemble rules for final submission generation
-
-## Model Stack
-
-| Component | Role |
+| Notebook | Purpose |
 | --- | --- |
-| `TabICLRegressor` | Main tabular foundation model used for activity prediction |
-| `LightGBM` | Strong non-foundation baseline for comparison |
-| `RDKit 2D` | Compact physicochemical descriptor block |
-| `Morgan r=2 / r=3` | Count-fingerprint views for local SAR signal |
-| `Mordred 2D` | Wide descriptor space for higher-capacity tabular models |
-| PCA variants | Dimensionality reduction experiments per descriptor family |
-| Outlier-aware ensemble | Median-based aggregation across selected model variants |
+| [`notebooks/fm_activity_prediction.ipynb`](./notebooks/fm_activity_prediction.ipynb) | Current activity-track notebook. Uses `TabICLRegressor` over RDKit 2D descriptors plus foundation-model blocks from CheMeleon, ChemBERTa, and MoLFormer. Uses scaffold-grouped CV, reports `RAE`, `MAE`, `R2`, `Spearman`, and `Kendall`, and writes `outputs/my_fm_activity_submission.csv`. |
+| [`notebooks/tabfm_activity_prediction.ipynb`](./notebooks/tabfm_activity_prediction.ipynb) | Earlier TabICL activity notebook with the original descriptor workflow. Useful as a reference point for the evolution of the activity experiments. |
+| [`notebooks/activity_prediction.ipynb`](./notebooks/activity_prediction.ipynb) | Simpler LightGBM baseline notebook for the activity track. |
+| [`notebooks/structure_prediction.ipynb`](./notebooks/structure_prediction.ipynb) | Structure-track tutorial notebook and submission example. |
 
-## Where To Look
+## Activity Modeling Stack
 
-| Path | Purpose |
-| --- | --- |
-| [`notebooks/tabfm_activity_prediction.ipynb`](./notebooks/tabfm_activity_prediction.ipynb) | Main notebook for TabICL, descriptor sweeps, PCA variants, and ensemble selection |
-| [`notebooks/activity_prediction.ipynb`](./notebooks/activity_prediction.ipynb) | Simpler RDKit + LightGBM baseline workflow |
-| [`ACTIVITY_MODEL_GUIDE.md`](./ACTIVITY_MODEL_GUIDE.md) | Modeling principles and validation mindset for future iterations |
-| [`validation/activity_validation.py`](./validation/activity_validation.py) | Submission-format checks for the 513-compound CSV |
-| [`evaluation/`](./evaluation) | Metric code used to score activity predictions |
-| [`outputs/`](./outputs) | Saved submissions and example prediction files |
+The current activity notebook uses:
 
-## Quick Start
+- `TabICLRegressor` as the main tabular foundation model
+- `LightGBM` in the simpler baseline notebook
+- `RDKit 2D` descriptors as a compact classical feature block
+- `CheMeleon` fingerprints via [`chemeleon_fingerprint.py`](./chemeleon_fingerprint.py), adapted from [`JacksonBurns/chemeleon`](https://github.com/JacksonBurns/chemeleon)
+- `DeepChem/ChemBERTa-77M-MTR`
+- `ibm-research/MoLFormer-XL-both-10pct`
+- fused multi-block feature views combining multiple descriptor families
+
+In the current setup, Morgan fingerprints are retained only for similarity diagnostics and fold analysis, not as training descriptors in the foundation-model notebook.
+
+## Environment
+
+The repo is expected to run from a `uv` environment rooted in `.venv`.
+
+### Install
+
+```bash
+uv sync
+```
+
+Install notebook test dependencies when needed:
 
 ```bash
 uv sync --group test
+```
+
+### Launch Jupyter
+
+Recommended:
+
+```bash
 uv run jupyter lab
+```
+
+If you prefer to use an existing Jupyter installation, register the repo kernel first:
+
+```bash
+uv run python -m ipykernel install --user --name moltabfm-pxr --display-name moltabfm-pxr-.venv
+```
+
+Then select the `moltabfm-pxr-.venv` kernel in the notebook UI.
+
+## First-Run Downloads
+
+Some notebooks pull model assets on first use:
+
+- activity tables are loaded from the Hugging Face dataset [`openadmet/pxr-challenge-train-test`](https://huggingface.co/datasets/openadmet/pxr-challenge-train-test)
+- ChemBERTa and MoLFormer weights are downloaded through `transformers`
+- CheMeleon downloads its published checkpoint into `~/.chemprop/`
+
+The foundation-model notebook caches computed embedding matrices under `outputs/fm_embedding_cache/` so reruns do not recompute them.
+
+`transformers` is pinned in [`pyproject.toml`](./pyproject.toml) because the MoLFormer remote-code path currently expects a 4.x release.
+
+## Validation And Testing
+
+Run notebook integration checks with:
+
+```bash
 uv run pytest -n=auto --nbmake --nbmake-timeout=1200 --maxfail=0 --disable-warnings notebooks/
 ```
 
-## Current Direction
+Submission and scoring utilities live in:
 
-The interesting part here is not challenge boilerplate. It is the model behavior:
+- [`validation/activity_validation.py`](./validation/activity_validation.py)
+- [`validation/structure_validation.py`](./validation/structure_validation.py)
+- [`evaluation/`](./evaluation)
 
-- which descriptor family gives TabICL the cleanest signal
-- when PCA helps and when it destroys useful structure
-- whether a foundation model actually beats a tuned gradient-boosted baseline
-- how stable ensemble predictions are on close analog series
-- how much prediction spread remains across descriptor-specific models
+## Repository Layout
 
-## Data
+| Path | Purpose |
+| --- | --- |
+| [`notebooks/`](./notebooks) | Tutorial and experiment notebooks. These are also the main CI surface. |
+| [`inputs/`](./inputs) | PXR structure/protein reference assets used by the structure workflow. |
+| [`outputs/`](./outputs) | Example submissions and generated artifacts. Only intentional examples should be committed. |
+| [`validation/`](./validation) | Submission-format and chemistry validation helpers. |
+| [`evaluation/`](./evaluation) | Scoring code for challenge outputs. |
+| [`ACTIVITY_MODEL_GUIDE.md`](./ACTIVITY_MODEL_GUIDE.md) | Notes on the activity modeling strategy and iteration direction. |
+| [`pyproject.toml`](./pyproject.toml) | Source of truth for the `uv` environment. |
+| [`environment.yaml`](./environment.yaml) | Legacy Conda environment definition. |
 
-Training and test tables come from the Hugging Face dataset:
-[`openadmet/pxr-challenge-train-test`](https://huggingface.co/datasets/openadmet/pxr-challenge-train-test)
+## Practical Notes
 
-If you want challenge logistics, dates, or broader background, use the official OpenADMET materials. This repo is for the model experiments.
+- Run notebooks from the repo root or through `uv run jupyter lab`.
+- The current foundation-model notebook expects to run inside the repo `.venv`.
+- The activity notebook includes an optional API submission cell; fill in the required metadata before enabling real submissions.
+- Generated outputs such as `outputs/my_fm_activity_submission.csv` are local artifacts unless you intentionally want them versioned.
+
+## Origin
+
+This repo is based on the OpenADMET tutorial project: [`OpenADMET/PXR-Challenge-Tutorial`](https://github.com/OpenADMET/PXR-Challenge-Tutorial), but it now reflects a more opinionated local experiment setup focused on reproducible notebook workflows and foundation-model feature experiments.
