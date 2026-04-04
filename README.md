@@ -2,6 +2,8 @@
 
 Focused workspace for OpenADMET PXR challenge experiments, with the current emphasis on the **activity track**, `uv`-managed environments, and notebook-first iteration.
 
+![PXR Challenge workflow](./docs/pxr_tfm_workflow.png)
+
 [![Python](https://img.shields.io/badge/Python-3.11%2B-0b3d91)](./pyproject.toml)
 [![uv](https://img.shields.io/badge/env-uv-5c7cfa)](https://github.com/astral-sh/uv)
 [![Activity](https://img.shields.io/badge/activity-TabICL%20%2B%20foundation%20embeddings-0f766e)](./notebooks/fm_activity_prediction.ipynb)
@@ -118,6 +120,8 @@ Submission and scoring utilities live in:
 - The current foundation-model notebook expects to run inside the repo `.venv`.
 - The activity notebook includes an optional API submission cell; fill in the required metadata before enabling real submissions.
 - Generated outputs such as `outputs/my_fm_activity_submission.csv` are local artifacts unless you intentionally want them versioned.
+
+Built here with good vibes. Thank you Codex and Claude. 🫶🙂
 
 ## Origin
 
