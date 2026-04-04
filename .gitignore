@@ -78,6 +78,7 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 outputs/fm_embedding_cache/
+outputs/my_fm_activity_submission.csv
 
 # IPython
 profile_default/

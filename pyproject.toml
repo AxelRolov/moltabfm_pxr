@@ -27,6 +27,7 @@ dependencies = [
     "torch",
     "transformers==4.57.3",
     "sentencepiece",
+    "chemprop>=2.2.0",
 ]
 
 [dependency-groups]
