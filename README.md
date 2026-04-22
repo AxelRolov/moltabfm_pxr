@@ -24,6 +24,8 @@ The center of gravity is now [`notebooks/fm_activity_prediction.ipynb`](./notebo
 
 | Notebook | Purpose |
 | --- | --- |
+| [`notebooks/tabfm_activity_prediction.py`](./notebooks/tabfm_activity_prediction.py) | marimo port of the original TabICL descriptor workflow. Adds MACCS keys alongside RDKit 2D, Morgan count, and Mordred descriptors, performs CV-based variant selection, and writes `outputs/my_tabfm_ensemble_submission.csv`. |
+| [`notebooks/fm_activity_prediction.py`](./notebooks/fm_activity_prediction.py) | marimo port of the foundation-model activity workflow. Uses RDKit 2D, MACCS, Mordred, CheMeleon, ChemBERTa, MoLFormer, optional MMELON, and the fused `fm_fusion` block with scaffold-grouped CV and writes `outputs/my_fm_activity_submission.csv`. |
 | [`notebooks/fm_activity_prediction.ipynb`](./notebooks/fm_activity_prediction.ipynb) | Current activity-track notebook. Uses `TabICLRegressor` over RDKit 2D descriptors plus foundation-model blocks from CheMeleon, ChemBERTa, and MoLFormer, with an optional MMELON block from `BiomedSciAI/biomed-multi-view`. Uses scaffold-grouped CV, reports `RAE`, `MAE`, `R2`, `Spearman`, and `Kendall`, and writes `outputs/my_fm_activity_submission.csv`. |
 | [`notebooks/tabfm_activity_prediction.ipynb`](./notebooks/tabfm_activity_prediction.ipynb) | Earlier TabICL activity notebook with the original descriptor workflow. Useful as a reference point for the evolution of the activity experiments. |
 | [`notebooks/activity_prediction.ipynb`](./notebooks/activity_prediction.ipynb) | Simpler LightGBM baseline notebook for the activity track. |
@@ -66,6 +68,20 @@ Recommended:
 
 ```bash
 uv run jupyter lab
+```
+
+### Launch marimo
+
+For the TabICL descriptor workflow with MACCS keys:
+
+```bash
+uv run marimo edit notebooks/tabfm_activity_prediction.py
+```
+
+For the foundation-model activity workflow:
+
+```bash
+uv run marimo edit notebooks/fm_activity_prediction.py
 ```
 
 If you prefer to use an existing Jupyter installation, register the repo kernel first:
