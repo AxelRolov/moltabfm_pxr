@@ -70,11 +70,12 @@ def _():
     from rdkit import Chem, DataStructs
     from rdkit.Chem import AllChem, MACCSkeys, rdFingerprintGenerator
     from rdkit.Chem.Scaffolds import MurckoScaffold
+    from rdkit.ML.Cluster import Butina
     from scipy.stats import kendalltau, spearmanr
     from sklearn.decomposition import PCA
     from sklearn.impute import SimpleImputer
     from sklearn.metrics import mean_absolute_error, r2_score
-    from sklearn.model_selection import GroupKFold
+    from sklearn.model_selection import GroupKFold, KFold
     from sklearn.preprocessing import StandardScaler
     from tabicl import TabICLRegressor
     from tqdm.auto import tqdm
@@ -114,7 +115,9 @@ def _():
         Chem,
         DataStructs,
         FineTunedCheMeleonEmbeddingModel,
+        Butina,
         GroupKFold,
+        KFold,
         LGBMRegressor,
         MACCSkeys,
         MordredCalculator,
@@ -230,6 +233,9 @@ def _(PROJECT_ROOT, torch):
     CHEMELEON_TUNED_LR = 1e-4
     CHEMELEON_TUNED_WEIGHT_DECAY = 1e-5
     CHEMELEON_TUNED_FREEZE_ENCODER = False
+    CV_SPLIT_STRATEGY = "cluster"
+    CV_RANDOM_STATE = 42
+    CLUSTER_TANIMOTO_THRESHOLD = 0.6
     MAX_LENGTH = 256
 
     def pick_device():
@@ -265,6 +271,9 @@ def _(PROJECT_ROOT, torch):
         CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
         CHEMELEON_TUNED_LR,
         CHEMELEON_TUNED_WEIGHT_DECAY,
+        CLUSTER_TANIMOTO_THRESHOLD,
+        CV_RANDOM_STATE,
+        CV_SPLIT_STRATEGY,
         DEVICE,
         DYNAMIC_FEATURE_NAMES,
         EMBEDDING_BATCH_SIZE,
@@ -280,6 +289,7 @@ def _(PROJECT_ROOT, torch):
 def _(
     AutoModel,
     AutoTokenizer,
+    Butina,
     CACHE_DIR,
     CheMeleonFingerprint,
     Chem,
@@ -662,6 +672,39 @@ def _(
         return fps
 
 
+    def compute_butina_cluster_groups(fps, similarity_threshold=0.6):
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0 and 1 for Butina clustering.")
+
+        valid_idx = [idx for idx, fp in enumerate(fps) if fp is not None]
+        valid_fps = [fps[idx] for idx in valid_idx]
+        cluster_groups = np.arange(len(fps), dtype=int) + len(fps)
+
+        if not valid_fps:
+            return cluster_groups
+
+        if len(valid_fps) == 1:
+            cluster_groups[valid_idx[0]] = 0
+            return cluster_groups
+
+        dists = []
+        for idx in tqdm(range(1, len(valid_fps)), desc="Butina distances"):
+            sims = DataStructs.BulkTanimotoSimilarity(valid_fps[idx], valid_fps[:idx])
+            dists.extend(1.0 - sim for sim in sims)
+
+        clusters = Butina.ClusterData(
+            dists,
+            len(valid_fps),
+            1.0 - similarity_threshold,
+            isDistData=True,
+        )
+        for cluster_id, cluster_member_positions in enumerate(clusters):
+            for member_position in cluster_member_positions:
+                cluster_groups[valid_idx[member_position]] = cluster_id
+
+        return cluster_groups
+
+
     def max_train_similarity(query_fps, ref_fps):
         valid_ref = [fp for fp in ref_fps if fp is not None]
         result = []
@@ -694,6 +737,7 @@ def _(
         canonicalize_smiles,
         compute_chemeleon_embeddings,
         compute_maccs_keys,
+        compute_butina_cluster_groups,
         compute_rdkit2d,
         compute_similarity_fingerprints,
         compute_tuned_chemeleon_matrices,
@@ -808,40 +852,85 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 3. Analog-Aware Cross-Validation
+    ## 3. Cross-Validation Strategy
 
-    The activity guide recommends validation that keeps close analogs together.
-    Here we use **Bemis-Murcko scaffold groups** for fold assignment and keep Morgan/Tanimoto only for diagnostics.
-    The Morgan diagnostic fingerprints are cached under `outputs/fm_embedding_cache/` so reruns do not rebuild them.
+    The notebook supports three CV strategies:
+    - `random`: shuffled `KFold`
+    - `scaffold`: `GroupKFold` over Bemis-Murcko scaffolds
+    - `cluster`: `GroupKFold` over Butina clusters built from Morgan/Tanimoto similarity
+
+    Morgan fingerprints are still cached under `outputs/fm_embedding_cache/` because
+    they are reused for clustering and for analog-similarity diagnostics.
     """)
     return
 
 
 @app.cell
 def _(
+    CLUSTER_TANIMOTO_THRESHOLD,
+    CV_RANDOM_STATE,
+    CV_SPLIT_STRATEGY,
+    GroupKFold,
+    KFold,
     cache_or_compute_fingerprints,
+    compute_butina_cluster_groups,
     compute_similarity_fingerprints,
     murcko_group,
     np,
     pd,
+    train_pec50,
     train_smiles,
 ):
-    scaffold_groups = np.asarray([murcko_group(smi) for smi in train_smiles])
-    unique_scaffolds = pd.Series(scaffold_groups).value_counts()
-    n_splits = min(5, unique_scaffolds.shape[0])
-    if n_splits < 2:
-        raise ValueError("Need at least two unique scaffold groups for grouped cross-validation.")
-
     train_similarity_fps = cache_or_compute_fingerprints(
         train_smiles,
         "train_similarity_morgan_r2_2048",
         compute_similarity_fingerprints,
     )
 
-    print(f"Unique scaffold groups: {unique_scaffolds.shape[0]}")
-    print(f"Using GroupKFold with {n_splits} folds")
-    unique_scaffolds.head(10)
-    return n_splits, scaffold_groups, train_similarity_fps
+    n_samples = len(train_smiles)
+    if CV_SPLIT_STRATEGY == "random":
+        n_splits = min(5, n_samples)
+        if n_splits < 2:
+            raise ValueError("Need at least two samples for random KFold cross-validation.")
+        split_groups = None
+        split_group_counts = None
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=CV_RANDOM_STATE)
+        split_strategy_label = "random"
+        print(f"Using random KFold with {n_splits} folds (seed={CV_RANDOM_STATE})")
+    elif CV_SPLIT_STRATEGY == "scaffold":
+        split_groups = np.asarray([murcko_group(smi) for smi in train_smiles])
+        split_group_counts = pd.Series(split_groups).value_counts()
+        n_splits = min(5, split_group_counts.shape[0])
+        if n_splits < 2:
+            raise ValueError("Need at least two unique scaffold groups for grouped cross-validation.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_strategy_label = "scaffold"
+        print(f"Unique scaffold groups: {split_group_counts.shape[0]}")
+        print(f"Using scaffold GroupKFold with {n_splits} folds")
+        split_group_counts.head(10)
+    elif CV_SPLIT_STRATEGY == "cluster":
+        split_groups = compute_butina_cluster_groups(
+            train_similarity_fps,
+            similarity_threshold=CLUSTER_TANIMOTO_THRESHOLD,
+        )
+        split_group_counts = pd.Series(split_groups).value_counts()
+        n_splits = min(5, split_group_counts.shape[0])
+        if n_splits < 2:
+            raise ValueError("Need at least two clusters for grouped cross-validation.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_strategy_label = "cluster"
+        print(f"Unique Butina clusters: {split_group_counts.shape[0]}")
+        print(
+            "Using cluster GroupKFold with "
+            f"{n_splits} folds (Tanimoto threshold={CLUSTER_TANIMOTO_THRESHOLD})"
+        )
+        split_group_counts.head(10)
+    else:
+        raise ValueError(
+            "Unsupported CV_SPLIT_STRATEGY. Expected one of: random, scaffold, cluster."
+        )
+
+    return n_splits, split_groups, split_strategy_label, splitter, train_similarity_fps
 
 
 @app.cell
@@ -870,7 +959,9 @@ def _(
     n_splits,
     np,
     pd,
-    scaffold_groups,
+    split_groups,
+    split_strategy_label,
+    splitter,
     tqdm,
     train_features,
     train_pec50,
@@ -891,8 +982,13 @@ def _(
         f"wd{str(CHEMELEON_TUNED_WEIGHT_DECAY).replace('.', 'p')}_"
         f"freeze{int(CHEMELEON_TUNED_FREEZE_ENCODER)}"
     )
+    split_iterator = (
+        splitter.split(train_pec50)
+        if split_groups is None
+        else splitter.split(train_pec50, groups=split_groups)
+    )
     with tqdm(total=total_fit_steps, desc="Grouped CV fits") as cv_progress:
-        for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(train_pec50, groups=scaffold_groups), start=1):
+        for fold_idx, (train_idx, test_idx) in enumerate(split_iterator, start=1):
             y_train = train_pec50.loc[train_idx, 'pEC50'].to_numpy()
             y_test = train_pec50.loc[test_idx, 'pEC50'].to_numpy()
             fold_preds = {}
@@ -940,7 +1036,7 @@ def _(
                 raw_key = _feature_name
                 fold_preds[raw_key] = raw_pred
                 raw_metrics = evaluate_regression_metrics(y_test, raw_pred)
-                cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
+                cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
                 cv_progress.update(1)
                 if USE_PCA:
                     X_tr_pca, X_te_pca, _pca, _scaler = fit_pca_projection(X_tr, X_te, n_components=PCA_N_COMPONENTS)
@@ -953,7 +1049,7 @@ def _(
                     pca_key = f'{_feature_name}_pca'
                     fold_preds[pca_key] = pca_pred
                     pca_metrics = evaluate_regression_metrics(y_test, pca_pred)
-                    cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
+                    cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
                     cv_progress.update(1)
             cv_progress.set_postfix(fold=fold_idx, model="LightGBM-rdkit2d")
             _lgbm = LGBMRegressor(verbose=-1)
@@ -962,9 +1058,9 @@ def _(
                 _lgbm.fit(train_features['rdkit2d'][train_idx], y_train)
                 lgbm_pred = _lgbm.predict(train_features['rdkit2d'][test_idx])
             lgbm_metrics = evaluate_regression_metrics(y_test, lgbm_pred)
-            cv_rows.append({'split': fold_idx, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
+            cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
             cv_progress.update(1)
-            fold_prediction_store.append({'split': fold_idx, 'y_test': y_test, 'preds': fold_preds})
+            fold_prediction_store.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'y_test': y_test, 'preds': fold_preds})
     cv_df = pd.DataFrame(cv_rows)
     cv_df.head()
     return cv_df, fold_prediction_store
