@@ -25,7 +25,7 @@ The center of gravity is now [`notebooks/fm_activity_prediction.ipynb`](./notebo
 | Notebook | Purpose |
 | --- | --- |
 | [`notebooks/tabfm_activity_prediction.py`](./notebooks/tabfm_activity_prediction.py) | marimo port of the original TabICL descriptor workflow. Adds MACCS keys alongside RDKit 2D, Morgan count, and Mordred descriptors, performs CV-based variant selection, and writes `outputs/my_tabfm_ensemble_submission.csv`. |
-| [`notebooks/fm_activity_prediction.py`](./notebooks/fm_activity_prediction.py) | marimo port of the foundation-model activity workflow. Uses RDKit 2D, MACCS, Mordred, CheMeleon, ChemBERTa, MoLFormer, optional MMELON, and the fused `fm_fusion` block with scaffold-grouped CV and writes `outputs/my_fm_activity_submission.csv`. |
+| [`notebooks/fm_activity_prediction.py`](./notebooks/fm_activity_prediction.py) | marimo port of the foundation-model activity workflow. Uses RDKit 2D, MACCS, Mordred, CheMeleon, ChemBERTa, and MoLFormer with scaffold-grouped CV, writes `outputs/my_fm_activity_submission.csv`, and also exports an all-model prediction table. |
 | [`notebooks/fm_activity_prediction.ipynb`](./notebooks/fm_activity_prediction.ipynb) | Current activity-track notebook. Uses `TabICLRegressor` over RDKit 2D descriptors plus foundation-model blocks from CheMeleon, ChemBERTa, and MoLFormer, with an optional MMELON block from `BiomedSciAI/biomed-multi-view`. Uses scaffold-grouped CV, reports `RAE`, `MAE`, `R2`, `Spearman`, and `Kendall`, and writes `outputs/my_fm_activity_submission.csv`. |
 | [`notebooks/tabfm_activity_prediction.ipynb`](./notebooks/tabfm_activity_prediction.ipynb) | Earlier TabICL activity notebook with the original descriptor workflow. Useful as a reference point for the evolution of the activity experiments. |
 | [`notebooks/activity_prediction.ipynb`](./notebooks/activity_prediction.ipynb) | Simpler LightGBM baseline notebook for the activity track. |
@@ -41,8 +41,6 @@ The current activity notebook uses:
 - `CheMeleon` fingerprints via [`chemeleon_fingerprint.py`](./chemeleon_fingerprint.py), adapted from [`JacksonBurns/chemeleon`](https://github.com/JacksonBurns/chemeleon)
 - `DeepChem/ChemBERTa-77M-MTR`
 - `ibm-research/MoLFormer-XL-both-10pct`
-- optional fused MMELON embeddings from [`BiomedSciAI/biomed-multi-view`](https://github.com/BiomedSciAI/biomed-multi-view) via the pretrained checkpoint `ibm/biomed.sm.mv-te-84m`
-- fused multi-block feature views combining multiple descriptor families
 
 In the current setup, Morgan fingerprints are retained only for similarity diagnostics and fold analysis, not as training descriptors in the foundation-model notebook.
 
@@ -99,12 +97,10 @@ Some notebooks pull model assets on first use:
 - activity tables are loaded from the Hugging Face dataset [`openadmet/pxr-challenge-train-test`](https://huggingface.co/datasets/openadmet/pxr-challenge-train-test)
 - ChemBERTa and MoLFormer weights are downloaded through `transformers`
 - CheMeleon downloads its published checkpoint into `~/.chemprop/`
-- when enabled, the optional MMELON block downloads the `ibm/biomed.sm.mv-te-84m` checkpoint through `biomed-multi-view`
 
 The foundation-model notebook caches computed embedding matrices under `outputs/fm_embedding_cache/` so reruns do not recompute them.
 
 `transformers` is pinned in [`pyproject.toml`](./pyproject.toml) because the MoLFormer remote-code path currently expects a 4.x release.
-The optional MMELON integration is intentionally disabled by default because its dependency stack is not included in this repo's base `uv` environment; install `biomed-multi-view` into the active notebook kernel before enabling `ENABLE_BIOMED_MULTIVIEW`.
 
 ## Validation And Testing
 
@@ -137,7 +133,6 @@ Submission and scoring utilities live in:
 
 - Run notebooks from the repo root or through `uv run jupyter lab`.
 - The current foundation-model notebook expects to run inside the repo `.venv`.
-- If you enable the MMELON block, `biomed-multi-view` must be importable in that same kernel.
 - The activity notebook includes an optional API submission cell; fill in the required metadata before enabling real submissions.
 - Generated outputs such as `outputs/my_fm_activity_submission.csv` are local artifacts unless you intentionally want them versioned.
 

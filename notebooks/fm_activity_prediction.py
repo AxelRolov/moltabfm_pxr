@@ -26,19 +26,16 @@ def _(mo):
     - CheMeleon descriptor-based foundation fingerprints
     - ChemBERTa SMILES embeddings
     - MoLFormer SMILES embeddings
-    - Optional MMELON fused multi-view embeddings from `BiomedSciAI/biomed-multi-view` (`ibm/biomed.sm.mv-te-84m`)
-    - A fused block that concatenates CheMeleon, ChemBERTa, MoLFormer, RDKit 2D, MACCS, Mordred, and optionally MMELON features
 
     **What changed versus the original notebook:**
     - Morgan fingerprints are used only for diagnostics and analog-aware validation, not as model inputs
     - cross-validation is scaffold-grouped instead of purely random
     - fold reporting tracks the challenge metric stack: `RAE`, `MAE`, `R2`, `Spearman`, and `Kendall`
     - final model selection is driven by **low RAE / MAE**, not by `R2` alone
+    - the ensemble threshold is fixed so no model is excluded from the consensus
 
-    The optional MMELON block is disabled by default because its dependency stack is intentionally not merged into this repo's base environment.
-    Enable it only after installing `biomed-multi-view` into the active notebook kernel.
-
-    This is still a ligand-only workflow. The fused block is a multi-view feature setup rather than a true ligand-protein multimodal model.
+    This is still a ligand-only workflow. Even with multiple descriptor families,
+    this is not a true ligand-protein multimodal model.
     A real multimodal follow-up would need a learned protein or pocket representation, not a constant PXR sequence vector.
     """)
     return
@@ -47,6 +44,7 @@ def _(mo):
 @app.cell
 def _():
     import hashlib
+    import pickle
     import sys
     import warnings
     from pathlib import Path
@@ -69,7 +67,7 @@ def _():
     from mordred import Calculator as MordredCalculator
     from mordred import descriptors as mordred_descriptors
     from rdkit import Chem, DataStructs
-    from rdkit.Chem import AllChem, MACCSkeys
+    from rdkit.Chem import AllChem, MACCSkeys, rdFingerprintGenerator
     from rdkit.Chem.Scaffolds import MurckoScaffold
     from scipy.stats import kendalltau, spearmanr
     from sklearn.decomposition import PCA
@@ -87,15 +85,6 @@ def _():
         raise ImportError(
             "This notebook needs the transformer stack from the repo environment. Run `uv sync` and launch Jupyter with `uv run jupyter lab`."
         ) from exc
-
-    try:
-        from bmfm_sm.api.smmv_api import SmallMoleculeMultiViewModel
-        from bmfm_sm.core.data_modules.namespace import LateFusionStrategy
-        BIOMED_MULTIVIEW_IMPORT_ERROR = None
-    except Exception as exc:
-        SmallMoleculeMultiViewModel = None
-        LateFusionStrategy = None
-        BIOMED_MULTIVIEW_IMPORT_ERROR = exc
 
     if int(transformers.__version__.split(".", 1)[0]) >= 5:
         raise RuntimeError(
@@ -118,23 +107,19 @@ def _():
     print(f"Using interpreter: {sys.executable}")
     print(f"Project root: {PROJECT_ROOT}")
     return (
-        AllChem,
         AutoModel,
         AutoTokenizer,
-        BIOMED_MULTIVIEW_IMPORT_ERROR,
         CheMeleonFingerprint,
         Chem,
         DataStructs,
         GroupKFold,
         LGBMRegressor,
-        LateFusionStrategy,
         MACCSkeys,
         MordredCalculator,
         MurckoScaffold,
         PCA,
         PROJECT_ROOT,
         SimpleImputer,
-        SmallMoleculeMultiViewModel,
         StandardScaler,
         TabICLRegressor,
         hashlib,
@@ -143,8 +128,10 @@ def _():
         mordred_descriptors,
         np,
         pd,
+        pickle,
         plt,
         r2_score,
+        rdFingerprintGenerator,
         sns,
         spearmanr,
         sys,
@@ -193,7 +180,7 @@ def _(mo):
 
     The core change in this notebook is descriptor generation.
 
-    We keep classical descriptor blocks for comparison and fusion:
+    We keep classical descriptor blocks for comparison:
     - RDKit 2D descriptors
     - MACCS keys
     - Mordred 2D descriptors
@@ -203,23 +190,14 @@ def _(mo):
     - `DeepChem/ChemBERTa-77M-MTR`
     - `ibm-research/MoLFormer-XL-both-10pct`
 
-    An optional fourth family adds fused MMELON embeddings from `BiomedSciAI/biomed-multi-view` using the pretrained checkpoint `ibm/biomed.sm.mv-te-84m`.
-
     All feature blocks are cached under `outputs/fm_embedding_cache/` so repeated notebook runs do not recompute them.
     CheMeleon itself will also download its published checkpoint into `~/.chemprop/` on first use.
-    The MMELON block stays off by default because its dependency stack is intentionally not installed through this repo's base `uv` environment.
-    Set `ENABLE_BIOMED_MULTIVIEW = True` only after `biomed-multi-view` is importable in the active notebook kernel.
     """)
     return
 
 
 @app.cell
-def _(
-    BIOMED_MULTIVIEW_IMPORT_ERROR,
-    PROJECT_ROOT,
-    SmallMoleculeMultiViewModel,
-    torch,
-):
+def _(PROJECT_ROOT, torch):
     CACHE_DIR = PROJECT_ROOT / "outputs" / "fm_embedding_cache"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -243,11 +221,6 @@ def _(
     CHEMELEON_BATCH_SIZE = 256
     MAX_LENGTH = 256
 
-    ENABLE_BIOMED_MULTIVIEW = False
-    BIOMED_MULTIVIEW_MODEL_ID = "ibm/biomed.sm.mv-te-84m"
-    BIOMED_MULTIVIEW_CACHE_KEY = "biomed_multiview_mv_te_84m"
-
-
     def pick_device():
         if torch.cuda.is_available():
             return "cuda"
@@ -257,14 +230,6 @@ def _(
 
 
     DEVICE = pick_device()
-    BIOMED_MULTIVIEW_DEVICE = DEVICE
-
-    if ENABLE_BIOMED_MULTIVIEW and SmallMoleculeMultiViewModel is None:
-        raise ImportError(
-            "ENABLE_BIOMED_MULTIVIEW=True but `biomed-multi-view` is not importable in this kernel. "
-            "Install `biomed-multi-view` and its requirements into the current notebook environment, then rerun the notebook. "
-            f"Original import error: {BIOMED_MULTIVIEW_IMPORT_ERROR!r}"
-        )
 
     FEATURE_BLOCKS = {
         "rdkit2d": ["rdkit2d"],
@@ -274,36 +239,14 @@ def _(
         "chemberta": ["chemberta"],
         "molformer": ["molformer"],
     }
-    if ENABLE_BIOMED_MULTIVIEW:
-        FEATURE_BLOCKS["biomed_multiview"] = ["biomed_multiview"]
-
-    fusion_block_names = [
-        "chemeleon",
-        "chemberta",
-        "molformer",
-        "rdkit2d",
-        "maccs",
-        "mordred",
-    ]
-    if ENABLE_BIOMED_MULTIVIEW:
-        fusion_block_names.append("biomed_multiview")
-    FEATURE_BLOCKS["fm_fusion"] = fusion_block_names
 
     print(f"Embedding device: {DEVICE}")
     print(f"Feature cache dir: {CACHE_DIR}")
-    if ENABLE_BIOMED_MULTIVIEW:
-        print(f"Biomed multi-view enabled: {BIOMED_MULTIVIEW_MODEL_ID}")
-    else:
-        print("Biomed multi-view block disabled. Set ENABLE_BIOMED_MULTIVIEW = True after installing `biomed-multi-view` if you want to include MMELON embeddings.")
     return (
-        BIOMED_MULTIVIEW_CACHE_KEY,
-        BIOMED_MULTIVIEW_DEVICE,
-        BIOMED_MULTIVIEW_MODEL_ID,
         CACHE_DIR,
         CHEMELEON_BATCH_SIZE,
         DEVICE,
         EMBEDDING_BATCH_SIZE,
-        ENABLE_BIOMED_MULTIVIEW,
         FEATURE_BLOCKS,
         MAX_LENGTH,
         PCA_N_COMPONENTS,
@@ -314,21 +257,17 @@ def _(
 
 @app.cell
 def _(
-    AllChem,
     AutoModel,
     AutoTokenizer,
-    BIOMED_MULTIVIEW_IMPORT_ERROR,
     CACHE_DIR,
     CheMeleonFingerprint,
     Chem,
     DataStructs,
-    LateFusionStrategy,
     MACCSkeys,
     MordredCalculator,
     MurckoScaffold,
     PCA,
     SimpleImputer,
-    SmallMoleculeMultiViewModel,
     StandardScaler,
     hashlib,
     kendalltau,
@@ -336,12 +275,13 @@ def _(
     mordred_descriptors,
     np,
     pd,
+    pickle,
     r2_score,
+    rdFingerprintGenerator,
     spearmanr,
     torch,
     tqdm,
     uru,
-    warnings,
 ):
     def canonicalize_smiles(smiles: str) -> str:
         mol = Chem.MolFromSmiles(smiles)
@@ -458,78 +398,6 @@ def _(
         return matrix
 
 
-    def embedding_to_numpy(embedding):
-        if isinstance(embedding, torch.Tensor):
-            return embedding.detach().cpu().numpy().astype(np.float32)
-        return np.asarray(embedding, dtype=np.float32)
-
-
-    def load_biomed_multiview_model(model_id, device="cpu"):
-        if SmallMoleculeMultiViewModel is None:
-            raise ImportError(
-                "`biomed-multi-view` is not importable in this kernel. "
-                "Install the package and its requirements into the active notebook environment "
-                "before enabling MMELON. "
-                f"Original import error: {BIOMED_MULTIVIEW_IMPORT_ERROR!r}"
-            )
-
-        model = SmallMoleculeMultiViewModel.from_pretrained(
-            LateFusionStrategy.ATTENTIONAL,
-            model_path=model_id,
-            inference_mode=True,
-            huggingface=True,
-        )
-        if device != "cpu" and hasattr(model, "to"):
-            try:
-                model = model.to(device)
-            except Exception as exc:
-                warnings.warn(
-                    f"Could not move biomed multi-view model to {device!r}; "
-                    f"falling back to CPU. Original error: {exc}"
-                )
-        model.eval()
-        return model
-
-
-    def compute_biomed_multiview_embeddings(smiles_list, model_id, device="cpu"):
-        model = load_biomed_multiview_model(model_id=model_id, device=device)
-
-        rows = []
-        desc = f"Embeddings: {model_id.split('/')[-1]}"
-        for smiles in tqdm(smiles_list, desc=desc):
-            try:
-                with torch.inference_mode():
-                    embedding = SmallMoleculeMultiViewModel.get_embeddings(
-                        smiles=smiles,
-                        model_path=model_id,
-                        pretrained_model=model,
-                        huggingface=True,
-                    )
-            except RuntimeError as exc:
-                if device == "cpu":
-                    raise
-                warnings.warn(
-                    f"Biomed multi-view inference on {device!r} failed; "
-                    f"retrying on CPU. Original error: {exc}"
-                )
-                model = load_biomed_multiview_model(model_id=model_id, device="cpu")
-                with torch.inference_mode():
-                    embedding = SmallMoleculeMultiViewModel.get_embeddings(
-                        smiles=smiles,
-                        model_path=model_id,
-                        pretrained_model=model,
-                        huggingface=True,
-                    )
-                device = "cpu"
-
-            rows.append(np.atleast_1d(embedding_to_numpy(embedding)))
-
-        matrix = np.stack(rows).astype(np.float32, copy=False)
-        if device == "cuda":
-            torch.cuda.empty_cache()
-        return matrix
-
-
     def cache_or_compute_matrix(smiles_list, cache_key, build_fn):
         digest = smiles_digest(smiles_list)
         cache_file = CACHE_DIR / f"{cache_key}_{digest}.npy"
@@ -541,6 +409,21 @@ def _(
         np.save(cache_file, matrix)
         print(f"Saved cache: {cache_file.name}")
         return matrix
+
+
+    def cache_or_compute_fingerprints(smiles_list, cache_key, build_fn):
+        digest = smiles_digest(smiles_list)
+        cache_file = CACHE_DIR / f"{cache_key}_{digest}.pkl"
+        if cache_file.exists():
+            print(f"Loading cache: {cache_file.name}")
+            with cache_file.open("rb") as handle:
+                return pickle.load(handle)
+
+        fps = build_fn(smiles_list)
+        with cache_file.open("wb") as handle:
+            pickle.dump(fps, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Saved cache: {cache_file.name}")
+        return fps
 
 
     def cache_or_compute_mordred_matrices(
@@ -671,13 +554,15 @@ def _(
 
 
     def compute_similarity_fingerprints(smiles_list, radius=2, n_bits=2048):
-        fps = []
-        for smiles in smiles_list:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                fps.append(None)
-            else:
-                fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits))
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+        mols = [Chem.MolFromSmiles(smiles) for smiles in tqdm(smiles_list, desc="Morgan similarity mols")]
+        valid_idx = [idx for idx, mol in enumerate(mols) if mol is not None]
+        valid_mols = [mols[idx] for idx in valid_idx]
+        fps = [None] * len(smiles_list)
+        if valid_mols:
+            batch_fps = generator.GetFingerprints(valid_mols, numThreads=0)
+            for idx, fp in zip(valid_idx, batch_fps):
+                fps[idx] = fp
         return fps
 
 
@@ -706,10 +591,10 @@ def _(
         return output
 
     return (
+        cache_or_compute_fingerprints,
         cache_or_compute_matrix,
         cache_or_compute_mordred_matrices,
         canonicalize_smiles,
-        compute_biomed_multiview_embeddings,
         compute_chemeleon_embeddings,
         compute_maccs_keys,
         compute_rdkit2d,
@@ -727,19 +612,14 @@ def _(
 
 @app.cell
 def _(
-    BIOMED_MULTIVIEW_CACHE_KEY,
-    BIOMED_MULTIVIEW_DEVICE,
-    BIOMED_MULTIVIEW_MODEL_ID,
     CHEMELEON_BATCH_SIZE,
     DEVICE,
     EMBEDDING_BATCH_SIZE,
-    ENABLE_BIOMED_MULTIVIEW,
     MAX_LENGTH,
     TRANSFORMER_MODEL_SPECS,
     cache_or_compute_matrix,
     cache_or_compute_mordred_matrices,
     canonicalize_smiles,
-    compute_biomed_multiview_embeddings,
     compute_chemeleon_embeddings,
     compute_maccs_keys,
     compute_rdkit2d,
@@ -787,10 +667,6 @@ def _(
         builder = lambda smiles, spec=spec: compute_transformer_embeddings(smiles, model_id=spec['model_id'], pooling=spec['pooling'], batch_size=EMBEDDING_BATCH_SIZE, max_length=MAX_LENGTH, trust_remote_code=spec['trust_remote_code'], revision=spec.get('revision'), device=DEVICE)
         train_blocks[_name] = cache_or_compute_matrix(train_smiles, f'train_{_name}', builder)
         test_blocks[_name] = cache_or_compute_matrix(test_smiles, f'test_{_name}', builder)
-    if ENABLE_BIOMED_MULTIVIEW:
-        biomed_builder = lambda smiles: compute_biomed_multiview_embeddings(smiles, model_id=BIOMED_MULTIVIEW_MODEL_ID, device=BIOMED_MULTIVIEW_DEVICE)
-        train_blocks['biomed_multiview'] = cache_or_compute_matrix(train_smiles, f'train_{BIOMED_MULTIVIEW_CACHE_KEY}', biomed_builder)
-        test_blocks['biomed_multiview'] = cache_or_compute_matrix(test_smiles, f'test_{BIOMED_MULTIVIEW_CACHE_KEY}', biomed_builder)
     print('Training block shapes:')
     for _name, matrix in train_blocks.items():
         print(f'  {_name:16s} {matrix.shape}')
@@ -837,19 +713,31 @@ def _(mo):
 
     The activity guide recommends validation that keeps close analogs together.
     Here we use **Bemis-Murcko scaffold groups** for fold assignment and keep Morgan/Tanimoto only for diagnostics.
+    The Morgan diagnostic fingerprints are cached under `outputs/fm_embedding_cache/` so reruns do not rebuild them.
     """)
     return
 
 
 @app.cell
-def _(compute_similarity_fingerprints, murcko_group, np, pd, train_smiles):
+def _(
+    cache_or_compute_fingerprints,
+    compute_similarity_fingerprints,
+    murcko_group,
+    np,
+    pd,
+    train_smiles,
+):
     scaffold_groups = np.asarray([murcko_group(smi) for smi in train_smiles])
     unique_scaffolds = pd.Series(scaffold_groups).value_counts()
     n_splits = min(5, unique_scaffolds.shape[0])
     if n_splits < 2:
         raise ValueError("Need at least two unique scaffold groups for grouped cross-validation.")
 
-    train_similarity_fps = compute_similarity_fingerprints(train_smiles)
+    train_similarity_fps = cache_or_compute_fingerprints(
+        train_smiles,
+        "train_similarity_morgan_r2_2048",
+        compute_similarity_fingerprints,
+    )
 
     print(f"Unique scaffold groups: {unique_scaffolds.shape[0]}")
     print(f"Using GroupKFold with {n_splits} folds")
@@ -872,6 +760,7 @@ def _(
     np,
     pd,
     scaffold_groups,
+    tqdm,
     train_features,
     train_pec50,
     train_similarity_fps,
@@ -880,43 +769,55 @@ def _(
     cv_rows = []
     fold_prediction_store = []
     splitter = GroupKFold(n_splits=n_splits)
-    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(train_pec50, groups=scaffold_groups), start=1):
-        y_train = train_pec50.loc[train_idx, 'pEC50'].to_numpy()
-        y_test = train_pec50.loc[test_idx, 'pEC50'].to_numpy()
-        fold_preds = {}
-        fold_similarity = max_train_similarity([train_similarity_fps[i] for i in test_idx], [train_similarity_fps[i] for i in train_idx])
-        similarity_summary = {'mean_test_max_tanimoto': float(np.nanmean(fold_similarity)), 'median_test_max_tanimoto': float(np.nanmedian(fold_similarity))}
-        for _feature_name in FEATURE_NAMES:
-            X_tr = train_features[_feature_name][train_idx]
-            X_te = train_features[_feature_name][test_idx]
-            raw_model = TabICLRegressor()
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                raw_model.fit(X_tr, y_train)
-                raw_pred = raw_model.predict(X_te)
-            raw_key = _feature_name
-            fold_preds[raw_key] = raw_pred
-            raw_metrics = evaluate_regression_metrics(y_test, raw_pred)
-            cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
-            if USE_PCA:
-                X_tr_pca, X_te_pca, _pca, _scaler = fit_pca_projection(X_tr, X_te, n_components=PCA_N_COMPONENTS)
-                pca_model = TabICLRegressor()
+    fits_per_fold = len(FEATURE_NAMES) * (2 if USE_PCA else 1) + 1
+    total_fit_steps = n_splits * fits_per_fold
+    with tqdm(total=total_fit_steps, desc="Grouped CV fits") as cv_progress:
+        for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(train_pec50, groups=scaffold_groups), start=1):
+            y_train = train_pec50.loc[train_idx, 'pEC50'].to_numpy()
+            y_test = train_pec50.loc[test_idx, 'pEC50'].to_numpy()
+            fold_preds = {}
+            fold_similarity = max_train_similarity(
+                [train_similarity_fps[i] for i in test_idx],
+                [train_similarity_fps[i] for i in train_idx],
+            )
+            similarity_summary = {'mean_test_max_tanimoto': float(np.nanmean(fold_similarity)), 'median_test_max_tanimoto': float(np.nanmedian(fold_similarity))}
+            for _feature_name in FEATURE_NAMES:
+                X_tr = train_features[_feature_name][train_idx]
+                X_te = train_features[_feature_name][test_idx]
+                cv_progress.set_postfix(fold=fold_idx, model=f"TabICL-{_feature_name}")
+                raw_model = TabICLRegressor()
                 with warnings.catch_warnings():
                     warnings.simplefilter('ignore')
-                    pca_model.fit(X_tr_pca, y_train)
-                    pca_pred = pca_model.predict(X_te_pca)
-                pca_key = f'{_feature_name}_pca'
-                fold_preds[pca_key] = pca_pred
-                pca_metrics = evaluate_regression_metrics(y_test, pca_pred)
-                cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
-        _lgbm = LGBMRegressor(verbose=-1)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            _lgbm.fit(train_features['rdkit2d'][train_idx], y_train)
-            lgbm_pred = _lgbm.predict(train_features['rdkit2d'][test_idx])
-        lgbm_metrics = evaluate_regression_metrics(y_test, lgbm_pred)
-        cv_rows.append({'split': fold_idx, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
-        fold_prediction_store.append({'split': fold_idx, 'y_test': y_test, 'preds': fold_preds})
+                    raw_model.fit(X_tr, y_train)
+                    raw_pred = raw_model.predict(X_te)
+                raw_key = _feature_name
+                fold_preds[raw_key] = raw_pred
+                raw_metrics = evaluate_regression_metrics(y_test, raw_pred)
+                cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
+                cv_progress.update(1)
+                if USE_PCA:
+                    X_tr_pca, X_te_pca, _pca, _scaler = fit_pca_projection(X_tr, X_te, n_components=PCA_N_COMPONENTS)
+                    cv_progress.set_postfix(fold=fold_idx, model=f"TabICL-{_feature_name}_pca")
+                    pca_model = TabICLRegressor()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        pca_model.fit(X_tr_pca, y_train)
+                        pca_pred = pca_model.predict(X_te_pca)
+                    pca_key = f'{_feature_name}_pca'
+                    fold_preds[pca_key] = pca_pred
+                    pca_metrics = evaluate_regression_metrics(y_test, pca_pred)
+                    cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
+                    cv_progress.update(1)
+            cv_progress.set_postfix(fold=fold_idx, model="LightGBM-rdkit2d")
+            _lgbm = LGBMRegressor(verbose=-1)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                _lgbm.fit(train_features['rdkit2d'][train_idx], y_train)
+                lgbm_pred = _lgbm.predict(train_features['rdkit2d'][test_idx])
+            lgbm_metrics = evaluate_regression_metrics(y_test, lgbm_pred)
+            cv_rows.append({'split': fold_idx, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
+            cv_progress.update(1)
+            fold_prediction_store.append({'split': fold_idx, 'y_test': y_test, 'preds': fold_preds})
     cv_df = pd.DataFrame(cv_rows)
     cv_df.head()
     return cv_df, fold_prediction_store
@@ -953,22 +854,39 @@ def _(mo):
     mo.md(r"""
     ## 4. Variant Selection And Ensemble Tuning
 
-    Choose the best raw/PCA form of each feature family using grouped-CV `RAE`, then sweep ensemble thresholds and aggregation rules.
+    Choose the best raw/PCA form only for the manually selected descriptor families,
+    then tune the aggregation rule while keeping the threshold effectively infinite
+    so every manual ensemble member participates in the consensus.
     """)
     return
 
 
 @app.cell
-def _(FEATURE_NAMES, USE_PCA, cv_df, metric_cols, pd):
+def _(FEATURE_NAMES):
+    AVAILABLE_FEATURE_NAMES = list(FEATURE_NAMES)
+    FEATURE_NAMES_MANUAL = ['rdkit2d', 'mordred', 'chemeleon']
+    invalid_feature_names = sorted(set(FEATURE_NAMES_MANUAL) - set(AVAILABLE_FEATURE_NAMES))
+    if invalid_feature_names:
+        raise ValueError(
+            "FEATURE_NAMES_MANUAL contains names that are not available in this notebook: "
+            + ", ".join(invalid_feature_names)
+        )
+    print(f"Available feature families: {AVAILABLE_FEATURE_NAMES}")
+    print(f"Manual ensemble feature families: {FEATURE_NAMES_MANUAL}")
+    return (FEATURE_NAMES_MANUAL,)
+
+
+@app.cell
+def _(FEATURE_NAMES_MANUAL, USE_PCA, cv_df, metric_cols, pd):
     tabicl_summary = (
         cv_df[cv_df["family"] == "TabICL"]
         .groupby("variant")[metric_cols]
         .agg(["mean", "std"])
         .sort_values(("RAE", "mean"))
     )
-    FINAL_ENSEMBLE_VARIANTS = []
+    FINAL_ENSEMBLE_VARIANTS_MANUAL = []
     variant_rows = []
-    for feature_name in FEATURE_NAMES:
+    for feature_name in FEATURE_NAMES_MANUAL:
         candidates = [feature_name]
         if USE_PCA:
             candidates.append(f"{feature_name}_pca")
@@ -981,7 +899,7 @@ def _(FEATURE_NAMES, USE_PCA, cv_df, metric_cols, pd):
             ),
         )
         best_variant = ranked_candidates[0]
-        FINAL_ENSEMBLE_VARIANTS.append(best_variant)
+        FINAL_ENSEMBLE_VARIANTS_MANUAL.append(best_variant)
         variant_rows.append(
             {
                 "feature_family": feature_name,
@@ -991,16 +909,16 @@ def _(FEATURE_NAMES, USE_PCA, cv_df, metric_cols, pd):
                 "mean_R2": tabicl_summary.loc[best_variant, ("R2", "mean")],
             }
         )
-    variant_selection_df = pd.DataFrame(variant_rows).sort_values(["mean_RAE", "mean_MAE"])
-    print(f"Final ensemble variants: {FINAL_ENSEMBLE_VARIANTS}")
-    variant_selection_df.round(4)
-    return (FINAL_ENSEMBLE_VARIANTS,)
+    manual_variant_selection_df = pd.DataFrame(variant_rows).sort_values(["mean_RAE", "mean_MAE"])
+    print(f"Manual final ensemble variants: {FINAL_ENSEMBLE_VARIANTS_MANUAL}")
+    manual_variant_selection_df.round(4)
+    return (FINAL_ENSEMBLE_VARIANTS_MANUAL,)
 
 
 @app.cell
 def _(
-    FEATURE_NAMES,
-    FINAL_ENSEMBLE_VARIANTS,
+    FEATURE_NAMES_MANUAL,
+    FINAL_ENSEMBLE_VARIANTS_MANUAL,
     USE_PCA,
     evaluate_regression_metrics,
     fold_prediction_store,
@@ -1008,20 +926,25 @@ def _(
     np,
     outlier_aware_ensemble,
     pd,
+    tqdm,
 ):
-    thresholds = [0.25, 0.5, 0.75, 1.0, 1.5]
+    thresholds = [float("inf")]
     sweep_rows = []
-    ensemble_key_sets = {'raw': FEATURE_NAMES, 'mixed': FINAL_ENSEMBLE_VARIANTS}
+    ensemble_key_sets = {'raw': FEATURE_NAMES_MANUAL, 'mixed': FINAL_ENSEMBLE_VARIANTS_MANUAL}
     if USE_PCA:
-        ensemble_key_sets['pca'] = [f'{_name}_pca' for _name in FEATURE_NAMES]
-    for fold_data in fold_prediction_store:
-        for ensemble_name, keys in ensemble_key_sets.items():
-            pred_matrix = np.stack([fold_data['preds'][key] for key in keys])
-            for threshold in thresholds:
-                for method in ('median', 'mean'):
-                    ensemble_pred = outlier_aware_ensemble(pred_matrix, threshold=threshold, method=method)
-                    metrics = evaluate_regression_metrics(fold_data['y_test'], ensemble_pred)
-                    sweep_rows.append({'split': fold_data['split'], 'ensemble': ensemble_name, 'threshold': threshold, 'method': method, **metrics})
+        ensemble_key_sets['pca'] = [f'{_name}_pca' for _name in FEATURE_NAMES_MANUAL]
+    total_sweep_steps = len(fold_prediction_store) * len(ensemble_key_sets) * len(thresholds) * 2
+    with tqdm(total=total_sweep_steps, desc="Ensemble sweep", leave=False) as sweep_progress:
+        for fold_data in fold_prediction_store:
+            for ensemble_name, keys in ensemble_key_sets.items():
+                pred_matrix = np.stack([fold_data['preds'][key] for key in keys])
+                for threshold in thresholds:
+                    for method in ('median', 'mean'):
+                        sweep_progress.set_postfix(split=fold_data['split'], ensemble=ensemble_name, method=method)
+                        ensemble_pred = outlier_aware_ensemble(pred_matrix, threshold=threshold, method=method)
+                        metrics = evaluate_regression_metrics(fold_data['y_test'], ensemble_pred)
+                        sweep_rows.append({'split': fold_data['split'], 'ensemble': ensemble_name, 'threshold': threshold, 'method': method, **metrics})
+                        sweep_progress.update(1)
     sweep_df = pd.DataFrame(sweep_rows)
     sweep_summary = sweep_df.groupby(['ensemble', 'threshold', 'method'])[metric_cols].mean().sort_values(['RAE', 'MAE', 'R2'], ascending=[True, True, False])
     sweep_summary.head(12)
@@ -1056,13 +979,18 @@ def _(mo):
 
 @app.cell
 def _(
+    cache_or_compute_fingerprints,
     compute_similarity_fingerprints,
     max_train_similarity,
     pd,
     test_smiles,
     train_similarity_fps,
 ):
-    test_similarity_fps = compute_similarity_fingerprints(test_smiles)
+    test_similarity_fps = cache_or_compute_fingerprints(
+        test_smiles,
+        "test_similarity_morgan_r2_2048",
+        compute_similarity_fingerprints,
+    )
     test_max_similarity = max_train_similarity(test_similarity_fps, train_similarity_fps)
 
     similarity_df = pd.DataFrame({"max_tanimoto_to_train": test_max_similarity})
@@ -1086,7 +1014,8 @@ def _(mo):
     mo.md(r"""
     ## 6. Final Predictions
 
-    Refit the selected variants on the full training set, then build the final outlier-aware ensemble on the blinded test set.
+    Refit the selected variants on the full training set, then build the final
+    no-exclusion ensemble on the blinded test set.
     """)
     return
 
@@ -1095,8 +1024,8 @@ def _(mo):
 def _(
     BEST_ENSEMBLE_TYPE,
     ENSEMBLE_METHOD,
-    FEATURE_NAMES,
-    FINAL_ENSEMBLE_VARIANTS,
+    FEATURE_NAMES_MANUAL,
+    FINAL_ENSEMBLE_VARIANTS_MANUAL,
     LGBMRegressor,
     OUTLIER_THRESHOLD,
     PCA_N_COMPONENTS,
@@ -1106,44 +1035,51 @@ def _(
     np,
     outlier_aware_ensemble,
     test_features,
+    tqdm,
     train_features,
     train_pec50,
     warnings,
 ):
     y_train_all = train_pec50["pEC50"].to_numpy()
     final_predictions = {}
-    raw_and_pca_variants = list(FEATURE_NAMES)
+    raw_and_pca_variants = list(FEATURE_NAMES_MANUAL)
     if USE_PCA:
-        raw_and_pca_variants = raw_and_pca_variants + [f"{name}_pca" for name in FEATURE_NAMES]
-    for variant in raw_and_pca_variants:
-        base_name = variant.replace("_pca", "")
-        X_train = train_features[base_name]
-        X_test = test_features[base_name]
-        if variant.endswith('_pca'):
-            X_train, X_test, _pca, _scaler = fit_pca_projection(
-                X_train,
-                X_test,
-                n_components=PCA_N_COMPONENTS,
-            )
-            print(f"{variant:18s} PCA dims: {train_features[base_name].shape[1]} -> {X_train.shape[1]}")
-        model = TabICLRegressor()
+        raw_and_pca_variants = raw_and_pca_variants + [f"{name}_pca" for name in FEATURE_NAMES_MANUAL]
+    total_final_fit_steps = len(raw_and_pca_variants) + 1
+    with tqdm(total=total_final_fit_steps, desc="Final model refits") as final_fit_progress:
+        for variant in raw_and_pca_variants:
+            base_name = variant.replace("_pca", "")
+            X_train = train_features[base_name]
+            X_test = test_features[base_name]
+            if variant.endswith('_pca'):
+                X_train, X_test, _pca, _scaler = fit_pca_projection(
+                    X_train,
+                    X_test,
+                    n_components=PCA_N_COMPONENTS,
+                )
+                print(f"{variant:18s} PCA dims: {train_features[base_name].shape[1]} -> {X_train.shape[1]}")
+            final_fit_progress.set_postfix(model=f"TabICL-{variant}")
+            model = TabICLRegressor()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model.fit(X_train, y_train_all)
+                final_predictions[f"TabICL-{variant}"] = model.predict(X_test)
+            preds = final_predictions[f"TabICL-{variant}"]
+            print(f"TabICL-{variant:18s} range: [{preds.min():.2f}, {preds.max():.2f}]")
+            final_fit_progress.update(1)
+        final_fit_progress.set_postfix(model="LightGBM-rdkit2d")
+        lgbm = LGBMRegressor(verbose=-1)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model.fit(X_train, y_train_all)
-            final_predictions[f"TabICL-{variant}"] = model.predict(X_test)
-        preds = final_predictions[f"TabICL-{variant}"]
-        print(f"TabICL-{variant:18s} range: [{preds.min():.2f}, {preds.max():.2f}]")
-    lgbm = LGBMRegressor(verbose=-1)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        lgbm.fit(train_features["rdkit2d"], y_train_all)
-        final_predictions["LightGBM-rdkit2d"] = lgbm.predict(test_features["rdkit2d"])
+            lgbm.fit(train_features["rdkit2d"], y_train_all)
+            final_predictions["LightGBM-rdkit2d"] = lgbm.predict(test_features["rdkit2d"])
+        final_fit_progress.update(1)
     if BEST_ENSEMBLE_TYPE == "raw":
-        ensemble_variant_names = [f"TabICL-{name}" for name in FEATURE_NAMES]
+        ensemble_variant_names = [f"TabICL-{name}" for name in FEATURE_NAMES_MANUAL]
     elif BEST_ENSEMBLE_TYPE == "pca":
-        ensemble_variant_names = [f"TabICL-{name}_pca" for name in FEATURE_NAMES]
+        ensemble_variant_names = [f"TabICL-{name}_pca" for name in FEATURE_NAMES_MANUAL]
     else:
-        ensemble_variant_names = [f"TabICL-{name}" for name in FINAL_ENSEMBLE_VARIANTS]
+        ensemble_variant_names = [f"TabICL-{name}" for name in FINAL_ENSEMBLE_VARIANTS_MANUAL]
     ensemble_matrix = np.stack([final_predictions[name] for name in ensemble_variant_names])
     final_predictions["TabICL-Ensemble"] = outlier_aware_ensemble(
         ensemble_matrix,
@@ -1164,6 +1100,15 @@ def _(SUBMISSION_MODEL, final_predictions, test_df_1):
     submission_df["pEC50"] = final_predictions[SUBMISSION_MODEL]
     submission_df.head()
     return (submission_df,)
+
+
+@app.cell
+def _(final_predictions, test_df_1):
+    all_model_prediction_df = test_df_1[["SMILES", "Molecule Name"]].copy()
+    for model_name, pred_i in final_predictions.items():
+        all_model_prediction_df[model_name] = pred_i
+    all_model_prediction_df.head()
+    return (all_model_prediction_df,)
 
 
 @app.cell
@@ -1222,10 +1167,16 @@ def _(mo):
 
 
 @app.cell
-def _(PROJECT_ROOT, submission_df):
-    submission_file = PROJECT_ROOT / "outputs" / "my_fm_activity_submission_upd220426.csv"
+def _(PROJECT_ROOT, all_model_prediction_df, submission_df):
+    all_predictions_file = PROJECT_ROOT / "outputs" / "my_fm_activity_all_model_predictions.csv"
+    all_predictions_file.parent.mkdir(parents=True, exist_ok=True)
+    all_model_prediction_df.to_csv(all_predictions_file, index=False)
+
+    submission_file = PROJECT_ROOT / "outputs" / "my_fm_activity_submission.csv"
     submission_file.parent.mkdir(parents=True, exist_ok=True)
     submission_df.to_csv(submission_file, index=False)
+    print(f"All-model prediction rows: {len(all_model_prediction_df)}")
+    print(f"Saved full prediction table: {all_predictions_file}")
     print(f"Submission rows: {len(submission_df)}")
     submission_df.head()
     return (submission_file,)
@@ -1257,17 +1208,17 @@ def _(submission_file):
     from gradio_client import Client, handle_file
     from huggingface_hub import get_token
 
-    ENABLE_API_SUBMISSION = False
+    ENABLE_API_SUBMISSION = True
     if ENABLE_API_SUBMISSION:
         submission_metadata = {
-            "username": "",
+            "username": "axelrolov",
             "user_alias": "",
             "anon_checkbox": False,
             "participant_name": "",
             "discord_username": "",
             "email": "",
             "affiliation": "",
-            "model_tag": "",
+            "model_tag": "https://github.com/AxelRolov/moltabfm_pxr",
             "paper_checkbox": False,
             "track_select": "Activity Prediction",
         }
@@ -1276,11 +1227,11 @@ def _(submission_file):
             for key, value in submission_metadata.items()
             if isinstance(value, str) and key != "user_alias" and not value
         ]
-        if missing_fields:
-            raise ValueError(
-                "Fill the submission metadata before enabling submission: "
-                + ", ".join(sorted(missing_fields))
-            )
+        #if missing_fields:
+        #    raise ValueError(
+        #        "Fill the submission metadata before enabling submission: "
+        #        + ", ".join(sorted(missing_fields))
+        #    )
         hf_token = get_token()
         client = Client("openadmet/pxr-challenge", token=hf_token)
         api_submission_result = client.predict(
@@ -1304,7 +1255,7 @@ def _(mo):
     ## Next Steps
 
     - swap in additional molecular foundation models and compare their grouped-CV `RAE`
-    - evaluate whether the fused block should stay purely frozen or move to downstream fine-tuning
+    - evaluate whether the frozen feature families should stay fixed or move to downstream fine-tuning
     - add activity-cliff diagnostics by linking fold errors to nearest-neighbor similarity
     - if you want a true multimodal model, move beyond this tabular fusion setup and build a ligand-protein architecture with a real pocket representation
     """)
