@@ -27,12 +27,26 @@ CHEMELEON_CHECKPOINT_URL = "https://zenodo.org/records/15460715/files/chemeleon_
 CHEMELEON_CHECKPOINT_NAME = "chemeleon_mp.pt"
 
 
+def _build_mpnn(
+    message_passing: nn.BondMessagePassing,
+    device: str | torch.device | None = None,
+) -> MPNN:
+    model = MPNN(
+        message_passing=message_passing,
+        agg=nn.MeanAggregation(),
+        predictor=RegressionFFN(input_dim=message_passing.output_dim),
+    )
+    model.eval()
+    if device is not None:
+        model.to(device=device)
+    return model
+
+
 def _load_chemeleon_model(
     device: str | torch.device | None = None,
     checkpoint_dir: Path | None = None,
 ) -> tuple[featurizers.SimpleMoleculeMolGraphFeaturizer, MPNN]:
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
-    agg = nn.MeanAggregation()
 
     ckpt_dir = checkpoint_dir or Path.home() / ".chemprop"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -45,15 +59,17 @@ def _load_chemeleon_model(
     message_passing = nn.BondMessagePassing(**checkpoint["hyper_parameters"])
     message_passing.load_state_dict(checkpoint["state_dict"])
 
-    model = MPNN(
-        message_passing=message_passing,
-        agg=agg,
-        predictor=RegressionFFN(input_dim=message_passing.output_dim),
-    )
-    model.eval()
+    model = _build_mpnn(message_passing=message_passing, device=device)
+    return featurizer, model
 
-    if device is not None:
-        model.to(device=device)
+
+def _build_chemprop_model(
+    device: str | torch.device | None = None,
+    **message_passing_kwargs,
+) -> tuple[featurizers.SimpleMoleculeMolGraphFeaturizer, MPNN]:
+    featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
+    message_passing = nn.BondMessagePassing(**message_passing_kwargs)
+    model = _build_mpnn(message_passing=message_passing, device=device)
 
     return featurizer, model
 
@@ -171,31 +187,32 @@ class FineTunedCheMeleonEmbeddingModel:
             leave=False,
             disable=not show_progress,
         )
-        for _epoch in epoch_iterator:
-            permutation = torch.randperm(len(mols))
-            running_loss = 0.0
-            total_seen = 0
-            for start in range(0, len(mols), batch_size):
-                batch_indices = permutation[start : start + batch_size]
-                batch_mols = [mols[int(idx)] for idx in batch_indices]
-                batch_targets = y[batch_indices]
+        with torch.enable_grad():
+            for _epoch in epoch_iterator:
+                permutation = torch.randperm(len(mols))
+                running_loss = 0.0
+                total_seen = 0
+                for start in range(0, len(mols), batch_size):
+                    batch_indices = permutation[start : start + batch_size]
+                    batch_mols = [mols[int(idx)] for idx in batch_indices]
+                    batch_targets = y[batch_indices]
 
-                embeddings = self._fingerprint_batch(batch_mols)
-                preds = self.head(embeddings).squeeze(-1)
-                loss = torch.nn.functional.mse_loss(preds, batch_targets)
+                    embeddings = self._fingerprint_batch(batch_mols)
+                    preds = self.head(embeddings).squeeze(-1)
+                    loss = torch.nn.functional.mse_loss(preds, batch_targets)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-                batch_size_actual = batch_targets.shape[0]
-                running_loss += float(loss.detach()) * batch_size_actual
-                total_seen += batch_size_actual
+                    batch_size_actual = batch_targets.shape[0]
+                    running_loss += float(loss.detach()) * batch_size_actual
+                    total_seen += batch_size_actual
 
-            mean_loss = running_loss / max(total_seen, 1)
-            history.append(mean_loss)
-            if show_progress:
-                epoch_iterator.set_postfix(loss=f"{mean_loss:.4f}")
+                mean_loss = running_loss / max(total_seen, 1)
+                history.append(mean_loss)
+                if show_progress:
+                    epoch_iterator.set_postfix(loss=f"{mean_loss:.4f}")
 
         self.model.eval()
         self.head.eval()
@@ -230,3 +247,30 @@ class FineTunedCheMeleonEmbeddingModel:
                 embeddings = self._fingerprint_batch(batch_mols)
                 chunks.append(self.head(embeddings).squeeze(-1).detach().cpu().numpy().astype(np.float32))
         return np.concatenate(chunks, axis=0) if chunks else np.empty((0,), dtype=np.float32)
+
+
+class FineTunedChempropEmbeddingModel(FineTunedCheMeleonEmbeddingModel):
+    """Task-trained Chemprop encoder that emits learned molecular embeddings."""
+
+    def __init__(
+        self,
+        device: str | torch.device | None = None,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+        freeze_encoder: bool = False,
+        **message_passing_kwargs,
+    ) -> None:
+        self.featurizer, self.model = _build_chemprop_model(
+            device=device,
+            **message_passing_kwargs,
+        )
+        self.head = torch.nn.Sequential(
+            torch.nn.Linear(self.model.message_passing.output_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, 1),
+        ).to(self.device)
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder:
+            for parameter in self.model.parameters():
+                parameter.requires_grad = False

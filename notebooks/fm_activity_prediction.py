@@ -25,12 +25,13 @@ def _(mo):
     - Mordred 2D descriptors
     - CheMeleon descriptor-based foundation fingerprints
     - fine-tuned CheMeleon task-adapted embeddings
+    - fine-tuned Chemprop task-adapted embeddings
     - ChemBERTa SMILES embeddings
     - MoLFormer SMILES embeddings
 
     **What changed versus the original notebook:**
     - Morgan fingerprints are used only for diagnostics and analog-aware validation, not as model inputs
-    - cross-validation is scaffold-grouped instead of purely random
+    - cross-validation can be random, scaffold-grouped, or cluster-grouped
     - fold reporting tracks the challenge metric stack: `RAE`, `MAE`, `R2`, `Spearman`, and `Kendall`
     - final model selection is driven by **low RAE / MAE**, not by `R2` alone
     - the ensemble threshold is fixed so no model is excluded from the consensus
@@ -63,7 +64,11 @@ def _():
     import seaborn as sns
     import torch
     import useful_rdkit_utils as uru
-    from chemeleon_fingerprint import CheMeleonFingerprint, FineTunedCheMeleonEmbeddingModel
+    from chemeleon_fingerprint import (
+        CheMeleonFingerprint,
+        FineTunedCheMeleonEmbeddingModel,
+        FineTunedChempropEmbeddingModel,
+    )
     from lightgbm import LGBMRegressor
     from mordred import Calculator as MordredCalculator
     from mordred import descriptors as mordred_descriptors
@@ -115,6 +120,7 @@ def _():
         Chem,
         DataStructs,
         FineTunedCheMeleonEmbeddingModel,
+        FineTunedChempropEmbeddingModel,
         Butina,
         GroupKFold,
         KFold,
@@ -190,9 +196,10 @@ def _(mo):
     - MACCS keys
     - Mordred 2D descriptors
 
-    Then we add four foundation-model feature families:
+    Then we add five foundation-model feature families:
     - `JacksonBurns/chemeleon` descriptor-based foundation fingerprints via the upstream `CheMeleonFingerprint` helper
     - `chemeleon_tuned`, a task-tuned CheMeleon encoder fine-tuned on the current training split and used as a separate embedding model
+    - `chemprop_tuned`, a task-tuned Chemprop encoder trained on the current training split and used as a separate embedding model
     - `DeepChem/ChemBERTa-77M-MTR`
     - `ibm-research/MoLFormer-XL-both-10pct`
 
@@ -233,6 +240,13 @@ def _(PROJECT_ROOT, torch):
     CHEMELEON_TUNED_LR = 1e-4
     CHEMELEON_TUNED_WEIGHT_DECAY = 1e-5
     CHEMELEON_TUNED_FREEZE_ENCODER = False
+    CHEMPROP_TUNED_BATCH_SIZE = 64
+    CHEMPROP_TUNED_EMBED_BATCH_SIZE = 256
+    CHEMPROP_TUNED_EPOCHS = 5
+    CHEMPROP_TUNED_HEAD_HIDDEN_DIM = 512
+    CHEMPROP_TUNED_DROPOUT = 0.1
+    CHEMPROP_TUNED_LR = 1e-4
+    CHEMPROP_TUNED_WEIGHT_DECAY = 1e-5
     CV_SPLIT_STRATEGY = "cluster"
     CV_RANDOM_STATE = 42
     CLUSTER_TANIMOTO_THRESHOLD = 0.6
@@ -256,7 +270,7 @@ def _(PROJECT_ROOT, torch):
         "chemberta": ["chemberta"],
         "molformer": ["molformer"],
     }
-    DYNAMIC_FEATURE_NAMES = ["chemeleon_tuned"]
+    DYNAMIC_FEATURE_NAMES = ["chemeleon_tuned", "chemprop_tuned"]
 
     print(f"Embedding device: {DEVICE}")
     print(f"Feature cache dir: {CACHE_DIR}")
@@ -271,6 +285,13 @@ def _(PROJECT_ROOT, torch):
         CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
         CHEMELEON_TUNED_LR,
         CHEMELEON_TUNED_WEIGHT_DECAY,
+        CHEMPROP_TUNED_BATCH_SIZE,
+        CHEMPROP_TUNED_DROPOUT,
+        CHEMPROP_TUNED_EMBED_BATCH_SIZE,
+        CHEMPROP_TUNED_EPOCHS,
+        CHEMPROP_TUNED_HEAD_HIDDEN_DIM,
+        CHEMPROP_TUNED_LR,
+        CHEMPROP_TUNED_WEIGHT_DECAY,
         CLUSTER_TANIMOTO_THRESHOLD,
         CV_RANDOM_STATE,
         CV_SPLIT_STRATEGY,
@@ -295,6 +316,7 @@ def _(
     Chem,
     DataStructs,
     FineTunedCheMeleonEmbeddingModel,
+    FineTunedChempropEmbeddingModel,
     MACCSkeys,
     MordredCalculator,
     MurckoScaffold,
@@ -394,6 +416,42 @@ def _(
             hidden_dim=hidden_dim,
             dropout=dropout,
             freeze_encoder=freeze_encoder,
+        )
+        tuned_model.fit(
+            train_smiles,
+            train_targets,
+            epochs=epochs,
+            batch_size=train_batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            progress_desc=progress_desc,
+        )
+        train_matrix = tuned_model.embed(train_smiles, batch_size=embed_batch_size)
+        eval_matrix = tuned_model.embed(eval_smiles, batch_size=embed_batch_size)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return train_matrix, eval_matrix
+
+
+    def compute_tuned_chemprop_matrices(
+        train_smiles,
+        train_targets,
+        eval_smiles,
+        *,
+        device="cpu",
+        epochs=5,
+        train_batch_size=64,
+        embed_batch_size=256,
+        hidden_dim=512,
+        dropout=0.1,
+        lr=1e-4,
+        weight_decay=1e-5,
+        progress_desc="Chemprop tuned",
+    ):
+        tuned_model = FineTunedChempropEmbeddingModel(
+            device=device,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
         )
         tuned_model.fit(
             train_smiles,
@@ -740,6 +798,7 @@ def _(
         compute_butina_cluster_groups,
         compute_rdkit2d,
         compute_similarity_fingerprints,
+        compute_tuned_chemprop_matrices,
         compute_tuned_chemeleon_matrices,
         compute_transformer_embeddings,
         evaluate_regression_metrics,
@@ -943,14 +1002,21 @@ def _(
     CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
     CHEMELEON_TUNED_LR,
     CHEMELEON_TUNED_WEIGHT_DECAY,
+    CHEMPROP_TUNED_BATCH_SIZE,
+    CHEMPROP_TUNED_DROPOUT,
+    CHEMPROP_TUNED_EMBED_BATCH_SIZE,
+    CHEMPROP_TUNED_EPOCHS,
+    CHEMPROP_TUNED_HEAD_HIDDEN_DIM,
+    CHEMPROP_TUNED_LR,
+    CHEMPROP_TUNED_WEIGHT_DECAY,
     DEVICE,
     FEATURE_NAMES,
-    GroupKFold,
     LGBMRegressor,
     PCA_N_COMPONENTS,
     TabICLRegressor,
     USE_PCA,
     cache_or_compute_tuned_chemeleon_matrices,
+    compute_tuned_chemprop_matrices,
     compute_tuned_chemeleon_matrices,
     evaluate_regression_metrics,
     fit_clean_feature_block,
@@ -971,7 +1037,6 @@ def _(
 ):
     cv_rows = []
     fold_prediction_store = []
-    splitter = GroupKFold(n_splits=n_splits)
     fits_per_fold = len(FEATURE_NAMES) * (2 if USE_PCA else 1) + 1
     total_fit_steps = n_splits * fits_per_fold
     tuned_config_key = (
@@ -981,6 +1046,13 @@ def _(
         f"lr{str(CHEMELEON_TUNED_LR).replace('.', 'p')}_"
         f"wd{str(CHEMELEON_TUNED_WEIGHT_DECAY).replace('.', 'p')}_"
         f"freeze{int(CHEMELEON_TUNED_FREEZE_ENCODER)}"
+    )
+    chemprop_tuned_config_key = (
+        f"ep{CHEMPROP_TUNED_EPOCHS}_tb{CHEMPROP_TUNED_BATCH_SIZE}_"
+        f"eb{CHEMPROP_TUNED_EMBED_BATCH_SIZE}_hd{CHEMPROP_TUNED_HEAD_HIDDEN_DIM}_"
+        f"dr{str(CHEMPROP_TUNED_DROPOUT).replace('.', 'p')}_"
+        f"lr{str(CHEMPROP_TUNED_LR).replace('.', 'p')}_"
+        f"wd{str(CHEMPROP_TUNED_WEIGHT_DECAY).replace('.', 'p')}"
     )
     split_iterator = (
         splitter.split(train_pec50)
@@ -1021,6 +1093,31 @@ def _(
                             weight_decay=CHEMELEON_TUNED_WEIGHT_DECAY,
                             freeze_encoder=CHEMELEON_TUNED_FREEZE_ENCODER,
                             progress_desc=f"CheMeleon tuned fold {fold_idx}",
+                        ),
+                    )
+                    X_tr, X_te, _variance_mask = fit_clean_feature_block(X_tr_raw, X_te_raw)
+                elif _feature_name == "chemprop_tuned":
+                    fold_train_smiles = [train_smiles[i] for i in train_idx]
+                    fold_test_smiles = [train_smiles[i] for i in test_idx]
+                    X_tr_raw, X_te_raw = cache_or_compute_tuned_chemeleon_matrices(
+                        fold_train_smiles,
+                        y_train,
+                        fold_test_smiles,
+                        cache_key_prefix=f"cv_fold_{fold_idx}_chemprop_tuned",
+                        config_key=chemprop_tuned_config_key,
+                        build_fn=lambda split_train_smiles, split_train_targets, split_eval_smiles, fold_idx=fold_idx: compute_tuned_chemprop_matrices(
+                            split_train_smiles,
+                            split_train_targets,
+                            split_eval_smiles,
+                            device=DEVICE,
+                            epochs=CHEMPROP_TUNED_EPOCHS,
+                            train_batch_size=CHEMPROP_TUNED_BATCH_SIZE,
+                            embed_batch_size=CHEMPROP_TUNED_EMBED_BATCH_SIZE,
+                            hidden_dim=CHEMPROP_TUNED_HEAD_HIDDEN_DIM,
+                            dropout=CHEMPROP_TUNED_DROPOUT,
+                            lr=CHEMPROP_TUNED_LR,
+                            weight_decay=CHEMPROP_TUNED_WEIGHT_DECAY,
+                            progress_desc=f"Chemprop tuned fold {fold_idx}",
                         ),
                     )
                     X_tr, X_te, _variance_mask = fit_clean_feature_block(X_tr_raw, X_te_raw)
@@ -1107,7 +1204,7 @@ def _(mo):
 @app.cell
 def _(FEATURE_NAMES):
     AVAILABLE_FEATURE_NAMES = list(FEATURE_NAMES)
-    FEATURE_NAMES_MANUAL = ['rdkit2d', 'mordred', 'chemeleon', 'chemeleon_tuned']
+    FEATURE_NAMES_MANUAL = ['rdkit2d', 'mordred', 'chemeleon', 'chemeleon_tuned', 'chemprop_tuned']
     invalid_feature_names = sorted(set(FEATURE_NAMES_MANUAL) - set(AVAILABLE_FEATURE_NAMES))
     if invalid_feature_names:
         raise ValueError(
@@ -1274,6 +1371,13 @@ def _(
     CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
     CHEMELEON_TUNED_LR,
     CHEMELEON_TUNED_WEIGHT_DECAY,
+    CHEMPROP_TUNED_BATCH_SIZE,
+    CHEMPROP_TUNED_DROPOUT,
+    CHEMPROP_TUNED_EMBED_BATCH_SIZE,
+    CHEMPROP_TUNED_EPOCHS,
+    CHEMPROP_TUNED_HEAD_HIDDEN_DIM,
+    CHEMPROP_TUNED_LR,
+    CHEMPROP_TUNED_WEIGHT_DECAY,
     DEVICE,
     ENSEMBLE_METHOD,
     FEATURE_NAMES_MANUAL,
@@ -1284,6 +1388,7 @@ def _(
     TabICLRegressor,
     USE_PCA,
     cache_or_compute_tuned_chemeleon_matrices,
+    compute_tuned_chemprop_matrices,
     compute_tuned_chemeleon_matrices,
     fit_clean_feature_block,
     fit_pca_projection,
@@ -1310,6 +1415,13 @@ def _(
         f"wd{str(CHEMELEON_TUNED_WEIGHT_DECAY).replace('.', 'p')}_"
         f"freeze{int(CHEMELEON_TUNED_FREEZE_ENCODER)}"
     )
+    chemprop_tuned_config_key = (
+        f"ep{CHEMPROP_TUNED_EPOCHS}_tb{CHEMPROP_TUNED_BATCH_SIZE}_"
+        f"eb{CHEMPROP_TUNED_EMBED_BATCH_SIZE}_hd{CHEMPROP_TUNED_HEAD_HIDDEN_DIM}_"
+        f"dr{str(CHEMPROP_TUNED_DROPOUT).replace('.', 'p')}_"
+        f"lr{str(CHEMPROP_TUNED_LR).replace('.', 'p')}_"
+        f"wd{str(CHEMPROP_TUNED_WEIGHT_DECAY).replace('.', 'p')}"
+    )
     total_final_fit_steps = len(raw_and_pca_variants) + 1
     with tqdm(total=total_final_fit_steps, desc="Final model refits") as final_fit_progress:
         for variant in raw_and_pca_variants:
@@ -1335,6 +1447,29 @@ def _(
                         weight_decay=CHEMELEON_TUNED_WEIGHT_DECAY,
                         freeze_encoder=CHEMELEON_TUNED_FREEZE_ENCODER,
                         progress_desc="CheMeleon tuned final",
+                    ),
+                )
+                X_train, X_test, _variance_mask = fit_clean_feature_block(X_train_raw, X_test_raw)
+            elif base_name == "chemprop_tuned":
+                X_train_raw, X_test_raw = cache_or_compute_tuned_chemeleon_matrices(
+                    train_smiles,
+                    y_train_all,
+                    test_smiles,
+                    cache_key_prefix="final_chemprop_tuned",
+                    config_key=chemprop_tuned_config_key,
+                    build_fn=lambda split_train_smiles, split_train_targets, split_eval_smiles: compute_tuned_chemprop_matrices(
+                        split_train_smiles,
+                        split_train_targets,
+                        split_eval_smiles,
+                        device=DEVICE,
+                        epochs=CHEMPROP_TUNED_EPOCHS,
+                        train_batch_size=CHEMPROP_TUNED_BATCH_SIZE,
+                        embed_batch_size=CHEMPROP_TUNED_EMBED_BATCH_SIZE,
+                        hidden_dim=CHEMPROP_TUNED_HEAD_HIDDEN_DIM,
+                        dropout=CHEMPROP_TUNED_DROPOUT,
+                        lr=CHEMPROP_TUNED_LR,
+                        weight_decay=CHEMPROP_TUNED_WEIGHT_DECAY,
+                        progress_desc="Chemprop tuned final",
                     ),
                 )
                 X_train, X_test, _variance_mask = fit_clean_feature_block(X_train_raw, X_test_raw)
