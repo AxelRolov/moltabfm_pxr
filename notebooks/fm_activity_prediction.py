@@ -24,6 +24,7 @@ def _(mo):
     - MACCS keys
     - Mordred 2D descriptors
     - CheMeleon descriptor-based foundation fingerprints
+    - fine-tuned CheMeleon task-adapted embeddings
     - ChemBERTa SMILES embeddings
     - MoLFormer SMILES embeddings
 
@@ -62,18 +63,19 @@ def _():
     import seaborn as sns
     import torch
     import useful_rdkit_utils as uru
-    from chemeleon_fingerprint import CheMeleonFingerprint
+    from chemeleon_fingerprint import CheMeleonFingerprint, FineTunedCheMeleonEmbeddingModel
     from lightgbm import LGBMRegressor
     from mordred import Calculator as MordredCalculator
     from mordred import descriptors as mordred_descriptors
     from rdkit import Chem, DataStructs
     from rdkit.Chem import AllChem, MACCSkeys, rdFingerprintGenerator
     from rdkit.Chem.Scaffolds import MurckoScaffold
+    from rdkit.ML.Cluster import Butina
     from scipy.stats import kendalltau, spearmanr
     from sklearn.decomposition import PCA
     from sklearn.impute import SimpleImputer
     from sklearn.metrics import mean_absolute_error, r2_score
-    from sklearn.model_selection import GroupKFold
+    from sklearn.model_selection import GroupKFold, KFold
     from sklearn.preprocessing import StandardScaler
     from tabicl import TabICLRegressor
     from tqdm.auto import tqdm
@@ -112,7 +114,10 @@ def _():
         CheMeleonFingerprint,
         Chem,
         DataStructs,
+        FineTunedCheMeleonEmbeddingModel,
+        Butina,
         GroupKFold,
+        KFold,
         LGBMRegressor,
         MACCSkeys,
         MordredCalculator,
@@ -185,8 +190,9 @@ def _(mo):
     - MACCS keys
     - Mordred 2D descriptors
 
-    Then we add three always-on foundation-model feature families:
+    Then we add four foundation-model feature families:
     - `JacksonBurns/chemeleon` descriptor-based foundation fingerprints via the upstream `CheMeleonFingerprint` helper
+    - `chemeleon_tuned`, a task-tuned CheMeleon encoder fine-tuned on the current training split and used as a separate embedding model
     - `DeepChem/ChemBERTa-77M-MTR`
     - `ibm-research/MoLFormer-XL-both-10pct`
 
@@ -219,6 +225,17 @@ def _(PROJECT_ROOT, torch):
     PCA_N_COMPONENTS = 0.95
     EMBEDDING_BATCH_SIZE = 64
     CHEMELEON_BATCH_SIZE = 256
+    CHEMELEON_TUNED_BATCH_SIZE = 64
+    CHEMELEON_TUNED_EMBED_BATCH_SIZE = 256
+    CHEMELEON_TUNED_EPOCHS = 5
+    CHEMELEON_TUNED_HEAD_HIDDEN_DIM = 512
+    CHEMELEON_TUNED_DROPOUT = 0.1
+    CHEMELEON_TUNED_LR = 1e-4
+    CHEMELEON_TUNED_WEIGHT_DECAY = 1e-5
+    CHEMELEON_TUNED_FREEZE_ENCODER = False
+    CV_SPLIT_STRATEGY = "cluster"
+    CV_RANDOM_STATE = 42
+    CLUSTER_TANIMOTO_THRESHOLD = 0.6
     MAX_LENGTH = 256
 
     def pick_device():
@@ -231,7 +248,7 @@ def _(PROJECT_ROOT, torch):
 
     DEVICE = pick_device()
 
-    FEATURE_BLOCKS = {
+    STATIC_FEATURE_BLOCKS = {
         "rdkit2d": ["rdkit2d"],
         "maccs": ["maccs"],
         "mordred": ["mordred"],
@@ -239,15 +256,28 @@ def _(PROJECT_ROOT, torch):
         "chemberta": ["chemberta"],
         "molformer": ["molformer"],
     }
+    DYNAMIC_FEATURE_NAMES = ["chemeleon_tuned"]
 
     print(f"Embedding device: {DEVICE}")
     print(f"Feature cache dir: {CACHE_DIR}")
     return (
         CACHE_DIR,
         CHEMELEON_BATCH_SIZE,
+        CHEMELEON_TUNED_BATCH_SIZE,
+        CHEMELEON_TUNED_DROPOUT,
+        CHEMELEON_TUNED_EMBED_BATCH_SIZE,
+        CHEMELEON_TUNED_EPOCHS,
+        CHEMELEON_TUNED_FREEZE_ENCODER,
+        CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
+        CHEMELEON_TUNED_LR,
+        CHEMELEON_TUNED_WEIGHT_DECAY,
+        CLUSTER_TANIMOTO_THRESHOLD,
+        CV_RANDOM_STATE,
+        CV_SPLIT_STRATEGY,
         DEVICE,
+        DYNAMIC_FEATURE_NAMES,
         EMBEDDING_BATCH_SIZE,
-        FEATURE_BLOCKS,
+        STATIC_FEATURE_BLOCKS,
         MAX_LENGTH,
         PCA_N_COMPONENTS,
         TRANSFORMER_MODEL_SPECS,
@@ -259,10 +289,12 @@ def _(PROJECT_ROOT, torch):
 def _(
     AutoModel,
     AutoTokenizer,
+    Butina,
     CACHE_DIR,
     CheMeleonFingerprint,
     Chem,
     DataStructs,
+    FineTunedCheMeleonEmbeddingModel,
     MACCSkeys,
     MordredCalculator,
     MurckoScaffold,
@@ -293,6 +325,11 @@ def _(
     def smiles_digest(smiles_list) -> str:
         joined = "\n".join(smiles_list)
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+
+
+    def array_digest(values) -> str:
+        array = np.asarray(values, dtype=np.float32)
+        return hashlib.sha256(array.tobytes()).hexdigest()[:12]
 
 
     def compute_rdkit2d(smiles_list):
@@ -334,6 +371,44 @@ def _(
         if device == "cuda":
             torch.cuda.empty_cache()
         return matrix
+
+
+    def compute_tuned_chemeleon_matrices(
+        train_smiles,
+        train_targets,
+        eval_smiles,
+        *,
+        device="cpu",
+        epochs=5,
+        train_batch_size=64,
+        embed_batch_size=256,
+        hidden_dim=512,
+        dropout=0.1,
+        lr=1e-4,
+        weight_decay=1e-5,
+        freeze_encoder=False,
+        progress_desc="CheMeleon tuned",
+    ):
+        tuned_model = FineTunedCheMeleonEmbeddingModel(
+            device=device,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            freeze_encoder=freeze_encoder,
+        )
+        tuned_model.fit(
+            train_smiles,
+            train_targets,
+            epochs=epochs,
+            batch_size=train_batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            progress_desc=progress_desc,
+        )
+        train_matrix = tuned_model.embed(train_smiles, batch_size=embed_batch_size)
+        eval_matrix = tuned_model.embed(eval_smiles, batch_size=embed_batch_size)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return train_matrix, eval_matrix
 
 
     def mean_pool(last_hidden_state, attention_mask):
@@ -424,6 +499,37 @@ def _(
             pickle.dump(fps, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"Saved cache: {cache_file.name}")
         return fps
+
+
+    def cache_or_compute_tuned_chemeleon_matrices(
+        train_smiles,
+        train_targets,
+        eval_smiles,
+        *,
+        cache_key_prefix,
+        config_key,
+        build_fn,
+    ):
+        train_digest = smiles_digest(train_smiles)
+        target_digest = array_digest(train_targets)
+        eval_digest = smiles_digest(eval_smiles)
+        train_cache_file = CACHE_DIR / f"{cache_key_prefix}_{config_key}_{train_digest}_{target_digest}_train.npy"
+        eval_cache_file = CACHE_DIR / f"{cache_key_prefix}_{config_key}_{train_digest}_{target_digest}_{eval_digest}_eval.npy"
+
+        if train_cache_file.exists() and eval_cache_file.exists():
+            print(f"Loading cache: {train_cache_file.name}")
+            print(f"Loading cache: {eval_cache_file.name}")
+            return (
+                np.load(train_cache_file, allow_pickle=False),
+                np.load(eval_cache_file, allow_pickle=False),
+            )
+
+        train_matrix, eval_matrix = build_fn(train_smiles, train_targets, eval_smiles)
+        np.save(train_cache_file, train_matrix)
+        np.save(eval_cache_file, eval_matrix)
+        print(f"Saved cache: {train_cache_file.name}")
+        print(f"Saved cache: {eval_cache_file.name}")
+        return train_matrix, eval_matrix
 
 
     def cache_or_compute_mordred_matrices(
@@ -566,6 +672,39 @@ def _(
         return fps
 
 
+    def compute_butina_cluster_groups(fps, similarity_threshold=0.6):
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between 0 and 1 for Butina clustering.")
+
+        valid_idx = [idx for idx, fp in enumerate(fps) if fp is not None]
+        valid_fps = [fps[idx] for idx in valid_idx]
+        cluster_groups = np.arange(len(fps), dtype=int) + len(fps)
+
+        if not valid_fps:
+            return cluster_groups
+
+        if len(valid_fps) == 1:
+            cluster_groups[valid_idx[0]] = 0
+            return cluster_groups
+
+        dists = []
+        for idx in tqdm(range(1, len(valid_fps)), desc="Butina distances"):
+            sims = DataStructs.BulkTanimotoSimilarity(valid_fps[idx], valid_fps[:idx])
+            dists.extend(1.0 - sim for sim in sims)
+
+        clusters = Butina.ClusterData(
+            dists,
+            len(valid_fps),
+            1.0 - similarity_threshold,
+            isDistData=True,
+        )
+        for cluster_id, cluster_member_positions in enumerate(clusters):
+            for member_position in cluster_member_positions:
+                cluster_groups[valid_idx[member_position]] = cluster_id
+
+        return cluster_groups
+
+
     def max_train_similarity(query_fps, ref_fps):
         valid_ref = [fp for fp in ref_fps if fp is not None]
         result = []
@@ -594,11 +733,14 @@ def _(
         cache_or_compute_fingerprints,
         cache_or_compute_matrix,
         cache_or_compute_mordred_matrices,
+        cache_or_compute_tuned_chemeleon_matrices,
         canonicalize_smiles,
         compute_chemeleon_embeddings,
         compute_maccs_keys,
+        compute_butina_cluster_groups,
         compute_rdkit2d,
         compute_similarity_fingerprints,
+        compute_tuned_chemeleon_matrices,
         compute_transformer_embeddings,
         evaluate_regression_metrics,
         fit_clean_feature_block,
@@ -678,18 +820,19 @@ def _(
 
 @app.cell
 def _(
-    FEATURE_BLOCKS,
+    DYNAMIC_FEATURE_NAMES,
     fit_clean_feature_block,
     np,
     pd,
     stack_feature_blocks,
+    STATIC_FEATURE_BLOCKS,
     test_blocks,
     train_blocks,
 ):
     train_features = {}
     test_features = {}
     feature_cleanup_summary = []
-    for _feature_name, block_names in FEATURE_BLOCKS.items():
+    for _feature_name, block_names in STATIC_FEATURE_BLOCKS.items():
         X_train_raw = stack_feature_blocks(train_blocks, block_names)
         X_test_raw = stack_feature_blocks(test_blocks, block_names)
         n_before = X_train_raw.shape[1]
@@ -701,7 +844,7 @@ def _(
         feature_cleanup_summary.append({'feature_name': _feature_name, 'n_blocks': len(block_names), 'features_before': n_before, 'features_after': int(_X_train.shape[1]), 'train_non_finite_replaced': n_non_finite_train, 'test_non_finite_replaced': n_non_finite_test})
         print(f'{_feature_name:10s} {len(block_names)} block(s): {n_before} -> {_X_train.shape[1]} features after cleanup; replaced non-finite train/test values: {n_non_finite_train}/{n_non_finite_test}')
     feature_cleanup_df = pd.DataFrame(feature_cleanup_summary)
-    FEATURE_NAMES = list(FEATURE_BLOCKS)
+    FEATURE_NAMES = list(STATIC_FEATURE_BLOCKS) + list(DYNAMIC_FEATURE_NAMES)
     feature_cleanup_df
     return FEATURE_NAMES, test_features, train_features
 
@@ -709,61 +852,121 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## 3. Analog-Aware Cross-Validation
+    ## 3. Cross-Validation Strategy
 
-    The activity guide recommends validation that keeps close analogs together.
-    Here we use **Bemis-Murcko scaffold groups** for fold assignment and keep Morgan/Tanimoto only for diagnostics.
-    The Morgan diagnostic fingerprints are cached under `outputs/fm_embedding_cache/` so reruns do not rebuild them.
+    The notebook supports three CV strategies:
+    - `random`: shuffled `KFold`
+    - `scaffold`: `GroupKFold` over Bemis-Murcko scaffolds
+    - `cluster`: `GroupKFold` over Butina clusters built from Morgan/Tanimoto similarity
+
+    Morgan fingerprints are still cached under `outputs/fm_embedding_cache/` because
+    they are reused for clustering and for analog-similarity diagnostics.
     """)
     return
 
 
 @app.cell
 def _(
+    CLUSTER_TANIMOTO_THRESHOLD,
+    CV_RANDOM_STATE,
+    CV_SPLIT_STRATEGY,
+    GroupKFold,
+    KFold,
     cache_or_compute_fingerprints,
+    compute_butina_cluster_groups,
     compute_similarity_fingerprints,
     murcko_group,
     np,
     pd,
+    train_pec50,
     train_smiles,
 ):
-    scaffold_groups = np.asarray([murcko_group(smi) for smi in train_smiles])
-    unique_scaffolds = pd.Series(scaffold_groups).value_counts()
-    n_splits = min(5, unique_scaffolds.shape[0])
-    if n_splits < 2:
-        raise ValueError("Need at least two unique scaffold groups for grouped cross-validation.")
-
     train_similarity_fps = cache_or_compute_fingerprints(
         train_smiles,
         "train_similarity_morgan_r2_2048",
         compute_similarity_fingerprints,
     )
 
-    print(f"Unique scaffold groups: {unique_scaffolds.shape[0]}")
-    print(f"Using GroupKFold with {n_splits} folds")
-    unique_scaffolds.head(10)
-    return n_splits, scaffold_groups, train_similarity_fps
+    n_samples = len(train_smiles)
+    if CV_SPLIT_STRATEGY == "random":
+        n_splits = min(5, n_samples)
+        if n_splits < 2:
+            raise ValueError("Need at least two samples for random KFold cross-validation.")
+        split_groups = None
+        split_group_counts = None
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=CV_RANDOM_STATE)
+        split_strategy_label = "random"
+        print(f"Using random KFold with {n_splits} folds (seed={CV_RANDOM_STATE})")
+    elif CV_SPLIT_STRATEGY == "scaffold":
+        split_groups = np.asarray([murcko_group(smi) for smi in train_smiles])
+        split_group_counts = pd.Series(split_groups).value_counts()
+        n_splits = min(5, split_group_counts.shape[0])
+        if n_splits < 2:
+            raise ValueError("Need at least two unique scaffold groups for grouped cross-validation.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_strategy_label = "scaffold"
+        print(f"Unique scaffold groups: {split_group_counts.shape[0]}")
+        print(f"Using scaffold GroupKFold with {n_splits} folds")
+        split_group_counts.head(10)
+    elif CV_SPLIT_STRATEGY == "cluster":
+        split_groups = compute_butina_cluster_groups(
+            train_similarity_fps,
+            similarity_threshold=CLUSTER_TANIMOTO_THRESHOLD,
+        )
+        split_group_counts = pd.Series(split_groups).value_counts()
+        n_splits = min(5, split_group_counts.shape[0])
+        if n_splits < 2:
+            raise ValueError("Need at least two clusters for grouped cross-validation.")
+        splitter = GroupKFold(n_splits=n_splits)
+        split_strategy_label = "cluster"
+        print(f"Unique Butina clusters: {split_group_counts.shape[0]}")
+        print(
+            "Using cluster GroupKFold with "
+            f"{n_splits} folds (Tanimoto threshold={CLUSTER_TANIMOTO_THRESHOLD})"
+        )
+        split_group_counts.head(10)
+    else:
+        raise ValueError(
+            "Unsupported CV_SPLIT_STRATEGY. Expected one of: random, scaffold, cluster."
+        )
+
+    return n_splits, split_groups, split_strategy_label, splitter, train_similarity_fps
 
 
 @app.cell
 def _(
+    CHEMELEON_TUNED_BATCH_SIZE,
+    CHEMELEON_TUNED_DROPOUT,
+    CHEMELEON_TUNED_EMBED_BATCH_SIZE,
+    CHEMELEON_TUNED_EPOCHS,
+    CHEMELEON_TUNED_FREEZE_ENCODER,
+    CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
+    CHEMELEON_TUNED_LR,
+    CHEMELEON_TUNED_WEIGHT_DECAY,
+    DEVICE,
     FEATURE_NAMES,
     GroupKFold,
     LGBMRegressor,
     PCA_N_COMPONENTS,
     TabICLRegressor,
     USE_PCA,
+    cache_or_compute_tuned_chemeleon_matrices,
+    compute_tuned_chemeleon_matrices,
     evaluate_regression_metrics,
+    fit_clean_feature_block,
     fit_pca_projection,
     max_train_similarity,
     n_splits,
     np,
     pd,
-    scaffold_groups,
+    split_groups,
+    split_strategy_label,
+    splitter,
     tqdm,
     train_features,
     train_pec50,
     train_similarity_fps,
+    train_smiles,
     warnings,
 ):
     cv_rows = []
@@ -771,8 +974,21 @@ def _(
     splitter = GroupKFold(n_splits=n_splits)
     fits_per_fold = len(FEATURE_NAMES) * (2 if USE_PCA else 1) + 1
     total_fit_steps = n_splits * fits_per_fold
+    tuned_config_key = (
+        f"ep{CHEMELEON_TUNED_EPOCHS}_tb{CHEMELEON_TUNED_BATCH_SIZE}_"
+        f"eb{CHEMELEON_TUNED_EMBED_BATCH_SIZE}_hd{CHEMELEON_TUNED_HEAD_HIDDEN_DIM}_"
+        f"dr{str(CHEMELEON_TUNED_DROPOUT).replace('.', 'p')}_"
+        f"lr{str(CHEMELEON_TUNED_LR).replace('.', 'p')}_"
+        f"wd{str(CHEMELEON_TUNED_WEIGHT_DECAY).replace('.', 'p')}_"
+        f"freeze{int(CHEMELEON_TUNED_FREEZE_ENCODER)}"
+    )
+    split_iterator = (
+        splitter.split(train_pec50)
+        if split_groups is None
+        else splitter.split(train_pec50, groups=split_groups)
+    )
     with tqdm(total=total_fit_steps, desc="Grouped CV fits") as cv_progress:
-        for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(train_pec50, groups=scaffold_groups), start=1):
+        for fold_idx, (train_idx, test_idx) in enumerate(split_iterator, start=1):
             y_train = train_pec50.loc[train_idx, 'pEC50'].to_numpy()
             y_test = train_pec50.loc[test_idx, 'pEC50'].to_numpy()
             fold_preds = {}
@@ -782,8 +998,35 @@ def _(
             )
             similarity_summary = {'mean_test_max_tanimoto': float(np.nanmean(fold_similarity)), 'median_test_max_tanimoto': float(np.nanmedian(fold_similarity))}
             for _feature_name in FEATURE_NAMES:
-                X_tr = train_features[_feature_name][train_idx]
-                X_te = train_features[_feature_name][test_idx]
+                if _feature_name == "chemeleon_tuned":
+                    fold_train_smiles = [train_smiles[i] for i in train_idx]
+                    fold_test_smiles = [train_smiles[i] for i in test_idx]
+                    X_tr_raw, X_te_raw = cache_or_compute_tuned_chemeleon_matrices(
+                        fold_train_smiles,
+                        y_train,
+                        fold_test_smiles,
+                        cache_key_prefix=f"cv_fold_{fold_idx}_chemeleon_tuned",
+                        config_key=tuned_config_key,
+                        build_fn=lambda split_train_smiles, split_train_targets, split_eval_smiles, fold_idx=fold_idx: compute_tuned_chemeleon_matrices(
+                            split_train_smiles,
+                            split_train_targets,
+                            split_eval_smiles,
+                            device=DEVICE,
+                            epochs=CHEMELEON_TUNED_EPOCHS,
+                            train_batch_size=CHEMELEON_TUNED_BATCH_SIZE,
+                            embed_batch_size=CHEMELEON_TUNED_EMBED_BATCH_SIZE,
+                            hidden_dim=CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
+                            dropout=CHEMELEON_TUNED_DROPOUT,
+                            lr=CHEMELEON_TUNED_LR,
+                            weight_decay=CHEMELEON_TUNED_WEIGHT_DECAY,
+                            freeze_encoder=CHEMELEON_TUNED_FREEZE_ENCODER,
+                            progress_desc=f"CheMeleon tuned fold {fold_idx}",
+                        ),
+                    )
+                    X_tr, X_te, _variance_mask = fit_clean_feature_block(X_tr_raw, X_te_raw)
+                else:
+                    X_tr = train_features[_feature_name][train_idx]
+                    X_te = train_features[_feature_name][test_idx]
                 cv_progress.set_postfix(fold=fold_idx, model=f"TabICL-{_feature_name}")
                 raw_model = TabICLRegressor()
                 with warnings.catch_warnings():
@@ -793,7 +1036,7 @@ def _(
                 raw_key = _feature_name
                 fold_preds[raw_key] = raw_pred
                 raw_metrics = evaluate_regression_metrics(y_test, raw_pred)
-                cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
+                cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'TabICL', 'variant': raw_key, 'model': f'TabICL-{raw_key}', **raw_metrics, **similarity_summary})
                 cv_progress.update(1)
                 if USE_PCA:
                     X_tr_pca, X_te_pca, _pca, _scaler = fit_pca_projection(X_tr, X_te, n_components=PCA_N_COMPONENTS)
@@ -806,7 +1049,7 @@ def _(
                     pca_key = f'{_feature_name}_pca'
                     fold_preds[pca_key] = pca_pred
                     pca_metrics = evaluate_regression_metrics(y_test, pca_pred)
-                    cv_rows.append({'split': fold_idx, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
+                    cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'TabICL', 'variant': pca_key, 'model': f'TabICL-{pca_key}', **pca_metrics, **similarity_summary})
                     cv_progress.update(1)
             cv_progress.set_postfix(fold=fold_idx, model="LightGBM-rdkit2d")
             _lgbm = LGBMRegressor(verbose=-1)
@@ -815,9 +1058,9 @@ def _(
                 _lgbm.fit(train_features['rdkit2d'][train_idx], y_train)
                 lgbm_pred = _lgbm.predict(train_features['rdkit2d'][test_idx])
             lgbm_metrics = evaluate_regression_metrics(y_test, lgbm_pred)
-            cv_rows.append({'split': fold_idx, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
+            cv_rows.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'family': 'LightGBM', 'variant': 'rdkit2d', 'model': 'LightGBM-rdkit2d', **lgbm_metrics, **similarity_summary})
             cv_progress.update(1)
-            fold_prediction_store.append({'split': fold_idx, 'y_test': y_test, 'preds': fold_preds})
+            fold_prediction_store.append({'split': fold_idx, 'split_strategy': split_strategy_label, 'y_test': y_test, 'preds': fold_preds})
     cv_df = pd.DataFrame(cv_rows)
     cv_df.head()
     return cv_df, fold_prediction_store
@@ -846,7 +1089,7 @@ def _(cv_df, plt, sns):
         _ax.tick_params(axis='x', rotation=45)
         _ax.set_title(f'Grouped CV {metric}')
     plt.tight_layout()
-    return
+    return (_fig,)
 
 
 @app.cell(hide_code=True)
@@ -864,7 +1107,7 @@ def _(mo):
 @app.cell
 def _(FEATURE_NAMES):
     AVAILABLE_FEATURE_NAMES = list(FEATURE_NAMES)
-    FEATURE_NAMES_MANUAL = ['rdkit2d', 'mordred', 'chemeleon']
+    FEATURE_NAMES_MANUAL = ['rdkit2d', 'mordred', 'chemeleon', 'chemeleon_tuned']
     invalid_feature_names = sorted(set(FEATURE_NAMES_MANUAL) - set(AVAILABLE_FEATURE_NAMES))
     if invalid_feature_names:
         raise ValueError(
@@ -1006,7 +1249,7 @@ def _(plt, similarity_df, sns):
     _ax.set_ylabel('Count')
     _ax.set_title('Blinded Test Set Similarity to Training Chemistry')
     plt.tight_layout()
-    return
+    return (_fig,)
 
 
 @app.cell(hide_code=True)
@@ -1023,6 +1266,15 @@ def _(mo):
 @app.cell
 def _(
     BEST_ENSEMBLE_TYPE,
+    CHEMELEON_TUNED_BATCH_SIZE,
+    CHEMELEON_TUNED_DROPOUT,
+    CHEMELEON_TUNED_EMBED_BATCH_SIZE,
+    CHEMELEON_TUNED_EPOCHS,
+    CHEMELEON_TUNED_FREEZE_ENCODER,
+    CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
+    CHEMELEON_TUNED_LR,
+    CHEMELEON_TUNED_WEIGHT_DECAY,
+    DEVICE,
     ENSEMBLE_METHOD,
     FEATURE_NAMES_MANUAL,
     FINAL_ENSEMBLE_VARIANTS_MANUAL,
@@ -1031,13 +1283,18 @@ def _(
     PCA_N_COMPONENTS,
     TabICLRegressor,
     USE_PCA,
+    cache_or_compute_tuned_chemeleon_matrices,
+    compute_tuned_chemeleon_matrices,
+    fit_clean_feature_block,
     fit_pca_projection,
     np,
     outlier_aware_ensemble,
+    test_smiles,
     test_features,
     tqdm,
     train_features,
     train_pec50,
+    train_smiles,
     warnings,
 ):
     y_train_all = train_pec50["pEC50"].to_numpy()
@@ -1045,19 +1302,53 @@ def _(
     raw_and_pca_variants = list(FEATURE_NAMES_MANUAL)
     if USE_PCA:
         raw_and_pca_variants = raw_and_pca_variants + [f"{name}_pca" for name in FEATURE_NAMES_MANUAL]
+    tuned_config_key = (
+        f"ep{CHEMELEON_TUNED_EPOCHS}_tb{CHEMELEON_TUNED_BATCH_SIZE}_"
+        f"eb{CHEMELEON_TUNED_EMBED_BATCH_SIZE}_hd{CHEMELEON_TUNED_HEAD_HIDDEN_DIM}_"
+        f"dr{str(CHEMELEON_TUNED_DROPOUT).replace('.', 'p')}_"
+        f"lr{str(CHEMELEON_TUNED_LR).replace('.', 'p')}_"
+        f"wd{str(CHEMELEON_TUNED_WEIGHT_DECAY).replace('.', 'p')}_"
+        f"freeze{int(CHEMELEON_TUNED_FREEZE_ENCODER)}"
+    )
     total_final_fit_steps = len(raw_and_pca_variants) + 1
     with tqdm(total=total_final_fit_steps, desc="Final model refits") as final_fit_progress:
         for variant in raw_and_pca_variants:
             base_name = variant.replace("_pca", "")
-            X_train = train_features[base_name]
-            X_test = test_features[base_name]
+            if base_name == "chemeleon_tuned":
+                X_train_raw, X_test_raw = cache_or_compute_tuned_chemeleon_matrices(
+                    train_smiles,
+                    y_train_all,
+                    test_smiles,
+                    cache_key_prefix="final_chemeleon_tuned",
+                    config_key=tuned_config_key,
+                    build_fn=lambda split_train_smiles, split_train_targets, split_eval_smiles: compute_tuned_chemeleon_matrices(
+                        split_train_smiles,
+                        split_train_targets,
+                        split_eval_smiles,
+                        device=DEVICE,
+                        epochs=CHEMELEON_TUNED_EPOCHS,
+                        train_batch_size=CHEMELEON_TUNED_BATCH_SIZE,
+                        embed_batch_size=CHEMELEON_TUNED_EMBED_BATCH_SIZE,
+                        hidden_dim=CHEMELEON_TUNED_HEAD_HIDDEN_DIM,
+                        dropout=CHEMELEON_TUNED_DROPOUT,
+                        lr=CHEMELEON_TUNED_LR,
+                        weight_decay=CHEMELEON_TUNED_WEIGHT_DECAY,
+                        freeze_encoder=CHEMELEON_TUNED_FREEZE_ENCODER,
+                        progress_desc="CheMeleon tuned final",
+                    ),
+                )
+                X_train, X_test, _variance_mask = fit_clean_feature_block(X_train_raw, X_test_raw)
+            else:
+                X_train = train_features[base_name]
+                X_test = test_features[base_name]
+            original_dim = X_train.shape[1]
             if variant.endswith('_pca'):
                 X_train, X_test, _pca, _scaler = fit_pca_projection(
                     X_train,
                     X_test,
                     n_components=PCA_N_COMPONENTS,
                 )
-                print(f"{variant:18s} PCA dims: {train_features[base_name].shape[1]} -> {X_train.shape[1]}")
+                print(f"{variant:18s} PCA dims: {original_dim} -> {X_train.shape[1]}")
             final_fit_progress.set_postfix(model=f"TabICL-{variant}")
             model = TabICLRegressor()
             with warnings.catch_warnings():
@@ -1123,7 +1414,7 @@ def _(final_predictions, pd, plt, sns, train_pec50):
     _ax.set_title('Training vs Predicted Test Distributions')
     plt.xticks(rotation=35, ha='right')
     plt.tight_layout()
-    return
+    return (_fig,)
 
 
 @app.cell(hide_code=True)
@@ -1153,7 +1444,7 @@ def _(OUTLIER_THRESHOLD, ensemble_variant_names, final_predictions, np, plt):
     _axes[1].set_ylabel('Molecules')
     _axes[1].set_title(f'Outlier Counts (threshold={OUTLIER_THRESHOLD})')
     plt.tight_layout()
-    return
+    return (_fig,)
 
 
 @app.cell(hide_code=True)
